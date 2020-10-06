@@ -98,7 +98,7 @@ void SetConstants(void) {
     EllipsoidNULL = Ell3NULL;
     Ellipse2D Ell2NULL = {-1.0, -1.0, -1.0};
     EllipseNULL = Ell2NULL;
-    */
+     */
 
 }
 
@@ -390,6 +390,50 @@ SourceDesc* FindSource(char* label) {
     return (NULL);
 }
 
+/** function to convert map projection string to map transformation parameter string by removing parameter tags
+ *
+ * Example: converts
+ * TRANSFORM  LAMBERT RefEllipsoid Clarke-1880  LatOrig 40.780400  LongOrig 15.415500  FirstStdParal 43.199300  SecondStdParal 44.996100  RotCW 0.000000
+ * to
+ * LAMBERT Clarke-1880  40.780400  15.415500  43.199300  44.996100  0.000000
+ *
+ ***/
+
+char* projection_str2transform_str(char* trans_str, char* proj_str) {
+
+    char *proj_ptr;
+    char *trans_ptr;
+
+    proj_ptr = proj_str;
+    trans_ptr = trans_str;
+    while (*proj_ptr != '\0') {
+        // skip tag
+        while (*proj_ptr != ' ' && *proj_ptr != '\0') {
+            proj_ptr++;
+        }
+        // skip space
+        while (*proj_ptr == ' ' && *proj_ptr != '\0') {
+            proj_ptr++;
+        }
+        // copy parameter value
+        while (*proj_ptr != ' ' && *proj_ptr != '\0') {
+            *trans_ptr = *proj_ptr;
+            trans_ptr++;
+            proj_ptr++;
+        }
+        // copy space
+        while (*proj_ptr == ' ' && *proj_ptr != '\0') {
+            *trans_ptr = *proj_ptr;
+            trans_ptr++;
+            proj_ptr++;
+        }
+    }
+
+    *trans_ptr = '\0';
+    return (trans_str);
+
+}
+
 /** function to read map transformation parameters from input line ***/
 
 int get_transform(int n_proj, char* in_line) {
@@ -584,6 +628,53 @@ int get_transform(int n_proj, char* in_line) {
             return (-1);
         }
 
+    } else if (strcmp(map_trans_type[n_proj], "TRANS_MERC") == 0) {
+
+        // 20160725 AJL - added TRANSVERSE MERCATOR PROJECTION (TM)
+
+        map_itype[n_proj] = MAP_TRANS_TM;
+        istat = sscanf(in_line, "%s %s %lf %lf %lf",
+                map_trans_type[n_proj], map_ref_ellipsoid[n_proj],
+                &map_orig_lat[n_proj], &map_orig_long[n_proj],
+                &map_rot[n_proj]);
+
+        ierr = 0;
+        if (checkRangeDouble("TRANS",
+                "LatOrig", map_orig_lat[n_proj], 1, -90.0, 1, 90.0) != 0)
+            ierr = -1;
+        if (checkRangeDouble("TRANS",
+                "LongOrig", map_orig_long[n_proj], 1, -180.0, 1, 180.0) != 0)
+            ierr = -1;
+        if (checkRangeDouble("TRANS",
+                "RotCW", map_rot[n_proj], 1, -360.0, 1, 360.0) != 0)
+            ierr = -1;
+
+        angle = -cRPD * map_rot[n_proj];
+        map_cosang[n_proj] = cos(angle);
+        map_sinang[n_proj] = sin(angle);
+
+        // initialize GMT projection values
+        if (map_setup_proxy(n_proj, map_ref_ellipsoid[n_proj]) < 0) {
+            nll_puterr(
+                    "ERROR: initializing general transformation parameters, RefEllipsoid may be invalid");
+            return (-1);
+        }
+
+        // initialize projection
+        vtm(n_proj, map_orig_long[n_proj], map_orig_lat[n_proj]);
+
+        sprintf(MapProjStr[n_proj],
+                "TRANSFORM  %s RefEllipsoid %s  LatOrig %lf  LongOrig %lf  RotCW %lf",
+                map_trans_type[n_proj], map_ref_ellipsoid[n_proj],
+                map_orig_lat[n_proj], map_orig_long[n_proj],
+                map_rot[n_proj]);
+        nll_putmsg(3, MapProjStr[n_proj]);
+
+        if (ierr < 0 || istat != 5) {
+            nll_puterr("ERROR: reading TRANS_MERC transformation parameters");
+            return (-1);
+        }
+
     } else {
 
         nll_puterr("ERROR: unrecognized map transformation type");
@@ -696,11 +787,314 @@ int display_grid_param(GridDesc* pgrid) {
     return (0);
 }
 
+/** function to determine if a grid is type Cascading 3D grid
+ *
+ * 20161019 AJL - added
+ */
+
+int isCascadingGrid(GridDesc* pgrid) {
+
+    return (pgrid->flagGridCascading == IS_CASCADING);
+
+}
+
+/** function set a grid as type Cascading 3D grid
+ *
+ * 20161020 AJL - added
+ */
+
+void setCascadingGrid(GridDesc* pgrid) {
+
+    pgrid->flagGridCascading = IS_CASCADING;
+
+    // flag dynamic arrays as uninitialized
+    pgrid->gridDesc_Cascading.xyz_scale = NULL;
+    pgrid->gridDesc_Cascading.zindex = NULL;
+
+}
+
+/** function to write grid buffer and header to disk ***/
+
+int WriteGrid3dBuf(GridDesc* pgrid, SourceDesc* psrce, char* filename, char* file_type) {
+
+
+    int istat;
+    FILE *fpio;
+    char fname[FILENAME_MAX];
+
+
+    /* write buffer file */
+
+    if (file_type != NULL) {
+        sprintf(fname, "%s.%s.buf", filename, file_type);
+    } else {
+        sprintf(fname, "%s.buf", filename);
+    }
+    if ((fpio = fopen(fname, "w")) == NULL) {
+        nll_puterr("ERROR: opening buffer output file.");
+        return (-1);
+    }
+    NumFilesOpen++;
+
+    if (fwrite((char *) pgrid->buffer, pgrid->buffer_size, 1, fpio) != 1) {
+        nll_puterr("ERROR: writing grid buffer output file.");
+        return (-1);
+    }
+
+    fclose(fpio);
+    NumFilesOpen--;
+
+
+    /* write header file */
+
+    istat = WriteGrid3dHdr(pgrid, psrce, filename, file_type);
+
+    return (istat);
+}
+
+/** function to write grid header to disk ***/
+
+int WriteGrid3dHdr(GridDesc* pgrid, SourceDesc* psrce,
+        char* filename, char* file_type) {
+
+    FILE *fpio;
+    char fname[FILENAME_MAX];
+
+
+    /* write header file */
+
+    if (file_type != NULL) {
+        sprintf(fname, "%s.%s.hdr", filename, file_type);
+    } else {
+        sprintf(fname, "%s.hdr", filename);
+    }
+
+    if ((fpio = fopen(fname, "w")) == NULL) {
+        nll_puterr("ERROR: opening grid output header file.");
+        return (-1);
+    }
+    NumFilesOpen++;
+
+    fprintf(fpio, "%d %d %d  %lf %lf %lf  %lf %lf %lf %s",
+            pgrid->numx, pgrid->numy, pgrid->numz,
+            pgrid->origx, pgrid->origy, pgrid->origz,
+            pgrid->dx, pgrid->dy, pgrid->dz, pgrid->chr_type);
+
+#ifdef GRID_FLOAT_TYPE_DOUBLE
+    fprintf(fpio, " DOUBLE\n");
+#else
+    fprintf(fpio, " FLOAT\n");
+#endif
+
+    if (pgrid->type == GRID_TIME || pgrid->type == GRID_TIME_2D
+            || pgrid->type == GRID_ANGLE || pgrid->type == GRID_ANGLE_2D
+            || pgrid->type == GRID_INCLINATION || pgrid->type == GRID_INCLINATION_2D
+            )
+        fprintf(fpio, "%s %lf %lf %lf\n",
+            psrce->label, psrce->x, psrce->y, psrce->z);
+
+    fprintf(fpio, "%s\n", MapProjStr[0]);
+
+    // write extra cascading grid header lines
+    if (isCascadingGrid(pgrid)) {
+        fprintf(fpio, "CASCADING_GRID %d ", pgrid->gridDesc_Cascading.num_z_merge_depths);
+        for (int n = 0; n < pgrid->gridDesc_Cascading.num_z_merge_depths; n++) {
+            fprintf(fpio, "%f,", pgrid->gridDesc_Cascading.z_merge_depths[n]);
+        }
+    }
+    fprintf(fpio, "\n");
+
+
+    fclose(fpio);
+    NumFilesOpen--;
+
+    return (0);
+}
+
+//#define DEBUG_CASC
+
+/** function to allocate buffer for Cascading 3D grid
+ *
+ * 20161019 AJL - added
+ */
+void* AllocateGrid_Cascading(GridDesc* pgrid, int allocate_buffer) {
+
+    // free any existing allocations
+    if (allocate_buffer) {
+        FreeGrid(pgrid);
+    } else {
+        FreeGrid_Cascading(pgrid);
+    }
+
+    // allocate cascading grid description index arrays
+    pgrid->gridDesc_Cascading.zindex = (void *) malloc((size_t) (pgrid->numz * sizeof (double)));
+    NumAllocations++;
+    pgrid->gridDesc_Cascading.xyz_scale = (void *) malloc((size_t) (pgrid->numz * sizeof (int)));
+    NumAllocations++;
+
+    // set indices and determine grid memory size
+    double reg_grid_depth = pgrid->origz;
+    int reg_grid_z_index = 0;
+    int reg_grid_z_index_below_last_merge_depth = 0;
+    double casc_grid_z_index = 0.0;
+    int merge_factor = 1;
+    long size_casc_grid = 0;
+    long size_reg_grid = 0;
+    // loop over specified merge depths
+    int below_deepest_merge_depth = 0;
+    for (int n = 0; n <= pgrid->gridDesc_Cascading.num_z_merge_depths; n++) {
+#ifdef DEBUG_CASC
+        printf("DEBUG: ndep %d depth=%f ===========================================\n", n,
+                (n < pgrid->gridDesc_Cascading.num_z_merge_depths) ? pgrid->gridDesc_Cascading.z_merge_depths[n] : 999);
+#endif
+        if (n == pgrid->gridDesc_Cascading.num_z_merge_depths) {
+            below_deepest_merge_depth = 1;
+        }
+        // set zindex and xyz_scale while regular grid depth < merge depth
+        while (reg_grid_z_index < pgrid->numz // above bottom of regular grid
+                && (below_deepest_merge_depth // below deepest specified merge depth
+                || (!below_deepest_merge_depth && reg_grid_depth < pgrid->gridDesc_Cascading.z_merge_depths[n]) // above current merge depth
+                || reg_grid_z_index_below_last_merge_depth % merge_factor != 0 // not at bottom of new cascading grid cell
+                )) {
+            if (reg_grid_z_index_below_last_merge_depth % merge_factor == 0) { // at top of new cascading grid depth level, increment grid memory size
+                //size_casc_grid += (pgrid->numx / merge_factor) * (pgrid->numy / merge_factor);  // truncate in x, y
+                //size_casc_grid += (int) ((double) pgrid->numx / (double) merge_factor) * (int) ((double) pgrid->numy / (double) merge_factor);  // allow fraction of full cascading cell x, y
+                int nx_use = 1 + (pgrid->numx - 1) / merge_factor;
+                nx_use += (pgrid->numx - 1) % merge_factor > 0 ? 1 : 0;
+                //nx_use += pgrid->numx % merge_factor != 1 ? 1 : 0;
+                int ny_use = 1 + (pgrid->numy - 1) / merge_factor;
+                ny_use += (pgrid->numy - 1) % merge_factor > 0 ? 1 : 0;
+                //ny_use += pgrid->numy % merge_factor != 1 ? 1 : 0;
+                size_casc_grid += nx_use * ny_use; // allow fraction of full cascading cell x, y
+            }
+            size_reg_grid += pgrid->numx * pgrid->numy;
+#ifdef DEBUG_CASC
+            printf("DEBUG: ireg %d, dep_reg %.1f, ds_casc %.1f, icasc %.2f, size_casc %ld/%ld [%.2f]\n",
+                    reg_grid_z_index, reg_grid_depth, pgrid->dz * (double) merge_factor, casc_grid_z_index,
+                    size_casc_grid, size_reg_grid, (double) size_casc_grid / (double) size_reg_grid);
+#endif
+            pgrid->gridDesc_Cascading.zindex[reg_grid_z_index] = casc_grid_z_index;
+            casc_grid_z_index += (1.0 / (double) merge_factor);
+            pgrid->gridDesc_Cascading.xyz_scale[reg_grid_z_index] = merge_factor;
+            reg_grid_z_index++;
+            reg_grid_z_index_below_last_merge_depth++;
+            reg_grid_depth += pgrid->dz;
+        }
+        if (!below_deepest_merge_depth && reg_grid_z_index >= pgrid->numz) {
+            sprintf(MsgStr, "WARNING: AllocateGrid_Cascading: z merge depth: %f below grid bottom: %f",
+                    pgrid->gridDesc_Cascading.z_merge_depths[n], pgrid->origz + (double) (pgrid->numz - 1) * pgrid->dz);
+            nll_puterr(MsgStr);
+            //return (NULL);
+        }
+        reg_grid_z_index_below_last_merge_depth = 0;
+        merge_factor *= 2; // creates a new cascade level
+    }
+    //pgrid->gridDesc_Cascading.num_z_cascading = pgrid->gridDesc_Cascading.zindex[pgrid->numz - 1];
+    pgrid->buffer_size = (size_t) (size_casc_grid * sizeof (GRID_FLOAT_TYPE));
+    // DEBUG pgrid->buffer_size -= 128  * sizeof (GRID_FLOAT_TYPE);
+    if (allocate_buffer) {
+        pgrid->buffer = (void *) malloc(pgrid->buffer_size);
+        if (pgrid->buffer != NULL)
+            NumAllocations++;
+    }
+#ifdef DEBUG_CASC
+    printf("DEBUG: byte size_casc %ld/%ld [%.2f], val size_casc %ld/%ld\n",
+            size_casc_grid * sizeof (GRID_FLOAT_TYPE), size_reg_grid * sizeof (GRID_FLOAT_TYPE), (double) size_casc_grid / (double) size_reg_grid,
+            size_casc_grid, size_reg_grid);
+#endif
+
+    return (pgrid->buffer);
+}
+
+/** function to create array for accessing Cascading 3D grid
+ *
+ * 20161019 AJL - added
+ */
+void*** CreateGridArray_Cascading(GridDesc* pgrid) {
+
+#ifdef DEBUG_CASC
+    for (int i = 0; i < pgrid->numz; i++) { // DEBUG
+        printf("iz_reg %d, zindex[i] %d, xyz_scale[i] %d\n",
+                i, pgrid->gridDesc_Cascading.zindex[i], pgrid->gridDesc_Cascading.xyz_scale[i]);
+    }
+#endif
+
+    GRID_FLOAT_TYPE ***garray;
+    if ((garray = (GRID_FLOAT_TYPE ***) malloc((size_t) pgrid->numx * sizeof (GRID_FLOAT_TYPE **))) == NULL)
+        return ((void***) garray);
+    NumAllocations++;
+
+    int ix_casc, iy_casc, iz_reg, numz;
+    int current_numz;
+    int xyz_scale;
+    GRID_FLOAT_TYPE *buf_ptr = (GRID_FLOAT_TYPE *) pgrid->buffer;
+    long bfactor = 1;
+    if (buf_ptr == NULL) { // buffer not created, arrays used to fseek in direct read of buffer on disk in ReadGrid3dValue()
+        bfactor = 2; // conversion from pointer addressing to absolute byte addressing
+        buf_ptr = 0;
+    }
+#ifdef DEBUG_CASC
+    printf("garray begin:  buf_ptr %ld  buf_ptr_end %ld\n", (long) buf_ptr, (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer));
+#endif
+    for (ix_casc = 0; ix_casc < pgrid->numx; ix_casc++) {
+        if ((garray[ix_casc] = (GRID_FLOAT_TYPE **) malloc((size_t) pgrid->numy * sizeof (GRID_FLOAT_TYPE *))) == NULL)
+            return (NULL);
+        NumAllocations++;
+        for (iy_casc = 0; iy_casc < pgrid->numy; iy_casc++) {
+            current_numz = -1;
+            // calculate num z cascading at this x,y
+            numz = 0;
+            for (iz_reg = 0; iz_reg < pgrid->numz; iz_reg++) { // loop over nominal regular grid z levels
+                if (pgrid->gridDesc_Cascading.zindex[iz_reg] == current_numz) { // still in current cascading grid z level
+                    continue;
+                }
+                // into new cascading grid z level
+                current_numz = pgrid->gridDesc_Cascading.zindex[iz_reg];
+                // check if xyz cascading cell exists at this ix_casc,iy_casc,numz
+                xyz_scale = pgrid->gridDesc_Cascading.xyz_scale[iz_reg];
+                if (ix_casc * xyz_scale < pgrid->numx + xyz_scale - 1 && iy_casc * xyz_scale < pgrid->numy + xyz_scale - 1) {
+                    //if (ix_casc <= pgrid->numx / xyz_scale && iy_casc <= pgrid->numy / xyz_scale) {
+                    numz++; // increment count of z levels for this x,y, cascading
+                } else {
+                    break; // reached bottom of z levels for this x,y cascading
+                }
+            }
+            garray[ix_casc][iy_casc] = buf_ptr;
+            //buf_ptr += numz * sizeof (GRID_FLOAT_TYPE);
+            buf_ptr += numz * bfactor;
+            if (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer > 2 * pgrid->buffer_size / sizeof (GRID_FLOAT_TYPE)) {
+                sprintf(MsgStr, "ERROR: CreateGridArray_Cascading: buf_ptr > buffer_size: x%d y%d numz%d (offset %ld buf_size %ld diff %ld) in: %s",
+                        ix_casc, iy_casc, numz, (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer), 2 * pgrid->buffer_size / sizeof (GRID_FLOAT_TYPE), (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer) - 2 * pgrid->buffer_size / sizeof (GRID_FLOAT_TYPE), pgrid->title);
+                nll_puterr(MsgStr);
+            }
+#ifdef DEBUG_CASC
+            //if ((ix_casc == 0 || ix_casc == pgrid->numx - 1) && (iy_casc == 0 || iy_casc == pgrid->numy - 1))
+            if (ix_casc < 4 && iy_casc < 4 && iz_reg < 4)
+                printf("garray [ix_casc %d, iy_casc %d]  buf_ptr %ld  buf_ptr_end %ld  numz %d\n",
+                    ix_casc, iy_casc, (long) buf_ptr, (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer), numz);
+#endif
+        }
+    }
+#ifdef DEBUG_CASC
+    printf("garray end:  buf_ptr %ld  buf_ptr_end %ld  buf_size %ld\n", (long) buf_ptr, (buf_ptr - (GRID_FLOAT_TYPE *) pgrid->buffer), pgrid->buffer_size / sizeof (GRID_FLOAT_TYPE));
+#endif
+
+    pgrid->array = (void***) garray;
+
+    return ((void***) garray);
+}
+
 /** function to allocate buffer for 3D grid ***/
 
-void* AllocateGrid(GridDesc* pgrid) {
+void* AllocateGrid(GridDesc * pgrid) {
 
-    pgrid->buffer = (void *) malloc((size_t) (pgrid->numx * pgrid->numy * pgrid->numz * sizeof (GRID_FLOAT_TYPE)));
+    if (isCascadingGrid(pgrid)) {
+        AllocateGrid_Cascading(pgrid, 1);
+        return (pgrid->buffer);
+    }
+
+    pgrid->buffer_size = (size_t) (pgrid->numx * pgrid->numy * pgrid->numz * sizeof (GRID_FLOAT_TYPE));
+    pgrid->buffer = (void *) malloc(pgrid->buffer_size);
     if (pgrid->buffer != NULL)
         NumAllocations++;
 
@@ -709,12 +1103,43 @@ void* AllocateGrid(GridDesc* pgrid) {
 
 /** function to free buffer for 3D grid ***/
 
-void FreeGrid(GridDesc* pgrid) {
-    if (pgrid->buffer != NULL) {
-        free(pgrid->buffer);
+void FreeGrid_Cascading(GridDesc * pgrid) {
+
+    // 20170207 AJL - z_merge_depths moved to fixed array to ease memory management
+    /*if (pgrid->gridDesc_Cascading.z_merge_depths != NULL) {
+        free(pgrid->gridDesc_Cascading.z_merge_depths);
+        pgrid->gridDesc_Cascading.z_merge_depths = NULL;
         NumAllocations--;
     }
-    pgrid->buffer = NULL;
+    pgrid->gridDesc_Cascading.z_merge_depths = NULL;*/
+    //printf("DEBUG: FreeGrid_Cascading: pgrid->gridDesc_Cascading.zindex %ld\n", (long) pgrid->gridDesc_Cascading.zindex);
+    if (pgrid->gridDesc_Cascading.zindex != NULL) {
+        free(pgrid->gridDesc_Cascading.zindex);
+        pgrid->gridDesc_Cascading.zindex = NULL;
+        NumAllocations--;
+    }
+    pgrid->gridDesc_Cascading.zindex = NULL;
+    if (pgrid->gridDesc_Cascading.xyz_scale != NULL) {
+        free(pgrid->gridDesc_Cascading.xyz_scale);
+        pgrid->gridDesc_Cascading.xyz_scale = NULL;
+        NumAllocations--;
+    }
+    pgrid->gridDesc_Cascading.xyz_scale = NULL;
+}
+
+/** function to free buffer for 3D grid ***/
+
+void FreeGrid(GridDesc * pgrid) {
+
+    if (isCascadingGrid(pgrid)) {
+        FreeGrid_Cascading(pgrid);
+    }
+
+    if (pgrid->buffer != NULL) {
+        free(pgrid->buffer);
+        pgrid->buffer = NULL;
+        NumAllocations--;
+    }
 }
 
 /** function to initialize buffer for 3D grid ***/
@@ -733,7 +1158,11 @@ int InitializeGrid(GridDesc* pgrid, GRID_FLOAT_TYPE init_value) {
 
 /** function to create array for accessing 3D grid ***/
 
-void*** CreateGridArray(GridDesc* pgrid) {
+void*** CreateGridArray(GridDesc * pgrid) {
+
+    if (isCascadingGrid(pgrid)) {
+        return (CreateGridArray_Cascading(pgrid));
+    }
 
     int ix, iy, numyz;
     GRID_FLOAT_TYPE ***garray;
@@ -754,27 +1183,28 @@ void*** CreateGridArray(GridDesc* pgrid) {
 
     pgrid->array = (void***) garray;
 
-
     return ((void***) garray);
 }
 
 /** function to free array for accessing 3D grid ***/
 
-void DestroyGridArray(GridDesc* pgrid) {
+void DestroyGridArray(GridDesc * pgrid) {
 
     int ix;
 
     if (pgrid->array != NULL) {
 
         for (ix = 0; ix < pgrid->numx; ix++) {
+            //printf("ix %d/%d pgrid->array[ix] %ld\n", ix, pgrid->numx, pgrid->array[ix]);
             free(pgrid->array[ix]);
+            pgrid->array[ix] = NULL;
             NumAllocations--;
         }
 
         free(pgrid->array);
+        pgrid->array = NULL;
         NumAllocations--;
 
-        pgrid->array = NULL;
 
     }
 
@@ -803,6 +1233,7 @@ void DuplicateGrid(GridDesc* pnew_grid, GridDesc* pold_grid, char *new_chr_type)
     /* create grid array access pointers */
     pnew_grid->array = CreateGridArray(pnew_grid);
     if (pnew_grid->array == NULL) {
+
         nll_puterr(
                 "ERROR: creating array for accessing duplicate 3D grid buffer.");
         exit(EXIT_ERROR_MEMORY);
@@ -854,6 +1285,7 @@ int CheckGridArray(GridDesc* pgrid, double gridMax, double gridMaxReplace,
         ierror = -1;
     }
     if (imin) {
+
         sprintf(MsgStr,
                 "WARNING: %d values < %e in grid replaced with %e",
                 imin, gridMin, gridMinReplace);
@@ -871,7 +1303,9 @@ int CheckGridArray(GridDesc* pgrid, double gridMax, double gridMaxReplace,
 
 /* reads from  array if fp_grid_new == NULL */
 
-int SumGrids(GridDesc* pgrid_sum, GridDesc* pgrid_new, FILE* fp_grid_new) {
+//#define DEBUG_SUMGRIDS
+
+int SumGrids(GridDesc* pgrid_sum, GridDesc* pgrid_new, FILE* fp_grid_new, double factor) {
 
     int ix, iy, iz;
     GRID_FLOAT_TYPE xval, yval, zval, newval;
@@ -885,11 +1319,15 @@ int SumGrids(GridDesc* pgrid_sum, GridDesc* pgrid_new, FILE* fp_grid_new) {
             zval = pgrid_sum->origz;
             for (iz = 0; iz < pgrid_sum->numz; iz++) {
 
-                if ((newval =
-                        ReadAbsInterpGrid3d(fp_grid_new,
-                        pgrid_new, xval, yval, zval))
-                        > -LARGE_FLOAT)
-                    ((GRID_FLOAT_TYPE ***) pgrid_sum->array)[ix][iy][iz] += newval;
+                if ((newval = ReadAbsInterpGrid3d(fp_grid_new, pgrid_new, xval, yval, zval, 0)) > -LARGE_FLOAT) {
+#ifdef DEBUG_SUMGRIDS
+                    float result = ((GRID_FLOAT_TYPE ***) pgrid_sum->array)[ix][iy][iz] + factor * newval;
+                    if (factor < 0.0 && fabs(result) > 1.0)
+                        printf("DEBUG: SumGrids: %d %d %d  %f + %f * %f = %f\n",
+                            ix, iy, iz, ((GRID_FLOAT_TYPE ***) pgrid_sum->array)[ix][iy][iz], factor, newval, result);
+#endif
+                    ((GRID_FLOAT_TYPE ***) pgrid_sum->array)[ix][iy][iz] += factor * newval;
+                }
 
                 zval += pgrid_sum->dz;
             }
@@ -914,20 +1352,26 @@ int SumGrids(GridDesc* pgrid_sum, GridDesc* pgrid_new, FILE* fp_grid_new) {
 int isOnGridBoundary(double xloc, double yloc, double zloc, GridDesc* pgrid,
         double tolerance_xy, double tolerance_z, int i_check_top) {
 
-    if (fabs(xloc - pgrid->origx) <= tolerance_xy)
-        return (10);
-    if (fabs(xloc - (pgrid->origx + (double) (pgrid->numx - 1) * pgrid->dx))
-            <= tolerance_xy)
-        return (11);
-    if (fabs(yloc - pgrid->origy) <= tolerance_xy)
-        return (20);
-    if (fabs(yloc - (pgrid->origy + (double) (pgrid->numy - 1) * pgrid->dy))
-            <= tolerance_xy)
-        return (21);
+    // 20151118 AJL - bug fix, should not perform these tests for GLOBAL mode, if whole earth TODO: add check if global search volume is whole earth?
+    // if (GeometryMode == MODE_GLOBAL) {
+    if (GeometryMode != MODE_GLOBAL) {
+        if (fabs(xloc - pgrid->origx) <= tolerance_xy)
+            return (10);
+        if (fabs(xloc - (pgrid->origx + (double) (pgrid->numx - 1) * pgrid->dx))
+                <= tolerance_xy)
+            return (11);
+        if (fabs(yloc - pgrid->origy) <= tolerance_xy)
+            return (20);
+        if (fabs(yloc - (pgrid->origy + (double) (pgrid->numy - 1) * pgrid->dy))
+                <= tolerance_xy)
+            return (21);
+    }
+
     if (i_check_top && fabs(zloc - pgrid->origz) <= tolerance_z)
         return (30);
     if (fabs(zloc - (pgrid->origz + (double) (pgrid->numz - 1) * pgrid->dz))
             <= tolerance_z)
+
         return (31);
 
     return (0);
@@ -948,6 +1392,7 @@ int IsPointInsideGrid(GridDesc* pgrid, double xloc, double yloc, double zloc) {
 
     if (zloc < pgrid->origz ||
             zloc > pgrid->origz + (double) (pgrid->numz - 1) * pgrid->dz)
+
         return (0);
 
     return (1);
@@ -1009,6 +1454,7 @@ int IsGridInside(GridDesc* pgrid_inside, GridDesc* pgrid, int iShiftFlag) {
             pgrid_inside->origz += zmin - zmin_in;
         else if (zmax_in > zmax)
             pgrid_inside->origz -= zmax_in - zmax;
+
         return (IsGridInside(pgrid_inside, pgrid, 0));
     }
 
@@ -1035,11 +1481,6 @@ int IsGrid2DBigEnough(GridDesc* pgrid_3D, GridDesc* pgrid_2D,
     double ymin, ymax, zmin, zmax;
 
 
-    // GLOBAL
-    if (GeometryMode == MODE_GLOBAL) {
-        return (1); //INGV do not worry about grid size
-    }
-
 
     /* check distances from grid location xcent, ycent */
     if (dist_horiz_min < dist_horiz_max) {
@@ -1060,6 +1501,13 @@ int IsGrid2DBigEnough(GridDesc* pgrid_3D, GridDesc* pgrid_2D,
                 return (-2);
         }
     }
+
+    // 20160926 AJL - moved this block here from before previous block
+    // GLOBAL
+    if (GeometryMode == MODE_GLOBAL) {
+        return (1); //INGV do not worry about grid size
+    }
+
 
     /* get extent of 2D grid */
     ymin = pgrid_2D->origy;
@@ -1094,6 +1542,7 @@ int IsGrid2DBigEnough(GridDesc* pgrid_3D, GridDesc* pgrid_2D,
         return (-1);
     /* check depth range */
     if (zmin_in < zmin || zmax_in > zmax)
+
         return (-3);
 
 
@@ -1102,7 +1551,7 @@ int IsGrid2DBigEnough(GridDesc* pgrid_3D, GridDesc* pgrid_2D,
 
 /** function to calculate epicentral (horizontal) distance from a source to an x-y poistion */
 
-INLINE double GetEpiDist(SourceDesc* psrce, double xval, double yval) {
+double GetEpiDist(SourceDesc* psrce, double xval, double yval) {
     double xtmp, ytmp;
 
     if (GeometryMode == MODE_GLOBAL) {
@@ -1111,13 +1560,14 @@ INLINE double GetEpiDist(SourceDesc* psrce, double xval, double yval) {
     } else {
         xtmp = xval - psrce->x;
         ytmp = yval - psrce->y;
+
         return (sqrt(xtmp * xtmp + ytmp * ytmp));
     }
 }
 
 /** function to calculate epicentral (horizontal) distance from a station to an x-y poistion */
 
-INLINE double GetEpiDistSta(StationDesc* psta, double xval, double yval) {
+double GetEpiDistSta(StationDesc* psta, double xval, double yval) {
     double xtmp, ytmp;
 
     if (GeometryMode == MODE_GLOBAL) {
@@ -1126,6 +1576,7 @@ INLINE double GetEpiDistSta(StationDesc* psta, double xval, double yval) {
     } else {
         xtmp = xval - psta->x;
         ytmp = yval - psta->y;
+
         return (sqrt(xtmp * xtmp + ytmp * ytmp));
     }
 }
@@ -1143,6 +1594,7 @@ double GetEpiAzim(SourceDesc* psrce, double xval, double yval) {
         azim = atan2(xtmp, ytmp) / cRPD;
         if (azim < 0.0)
             azim += 360.0;
+
         return (azim);
     }
 }
@@ -1161,25 +1613,27 @@ double GetEpiAzimSta(StationDesc* psta, double xval, double yval) {
         azim = atan2(xtmp, ytmp) / cRPD;
         if (azim < 0.0)
             azim += 360.0;
+
         return (azim);
     }
 }
 
 /** function to calculate distance between 2 XYZ points */
 
-INLINE double Dist3D(double x1, double x2, double y1, double y2,
+double Dist3D(double x1, double x2, double y1, double y2,
         double z1, double z2) {
     double dx, dy, dz;
 
     dx = x1 - x2;
     dy = y1 - y2;
     dz = z1 - z2;
+
     return (sqrt(dx * dx + dy * dy + dz * dz));
 }
 
 /** function to calculate average inter-station distance */
 
-INLINE double calcAveInterStationDistance(SourceDesc *stations, int numStations) {
+double calcAveInterStationDistance(SourceDesc *stations, int numStations) {
 
     int ndist, n, m = 0;
     double x, y;
@@ -1221,7 +1675,7 @@ INLINE double calcAveInterStationDistance(SourceDesc *stations, int numStations)
 
 /** function to check if station location is known */
 
-INLINE int stationLocationIsKnown(double x, double y) {
+int stationLocationIsKnown(double x, double y) {
 
     // station location not known
     if (x == 0.0 && y == 0.0)
@@ -1229,6 +1683,7 @@ INLINE int stationLocationIsKnown(double x, double y) {
 
     // station location not known
     if (x < -LARGE_DOUBLE / 2.0 || y < -LARGE_DOUBLE / 2.0)
+
         return (0);
 
     // station location known
@@ -1236,94 +1691,9 @@ INLINE int stationLocationIsKnown(double x, double y) {
 
 }
 
-/** function to write grid buffer and header to disk ***/
-
-int WriteGrid3dBuf(GridDesc* pgrid, SourceDesc* psrce, char* filename, char* file_type) {
-
-    int istat;
-    FILE *fpio;
-    char fname[FILENAME_MAX];
-
-
-    /* write buffer file */
-
-    sprintf(fname, "%s.%s.buf", filename, file_type);
-    if ((fpio = fopen(fname, "w")) == NULL) {
-        nll_puterr("ERROR: opening buffer output file.");
-        return (-1);
-    }
-    NumFilesOpen++;
-
-    if (fwrite((char *) pgrid->buffer,
-            (pgrid->numx * pgrid->numy * pgrid->numz * sizeof (GRID_FLOAT_TYPE)),
-            1, fpio) != 1) {
-        nll_puterr("ERROR: writing grid buffer output file.");
-        return (-1);
-    }
-
-    fclose(fpio);
-    NumFilesOpen--;
-
-
-    /* write header file */
-
-    istat = WriteGrid3dHdr(pgrid, psrce, filename, file_type);
-
-    return (istat);
-}
-
-/** function to write grid header to disk ***/
-
-int WriteGrid3dHdr(GridDesc* pgrid, SourceDesc* psrce,
-        char* filename, char* file_type) {
-
-    FILE *fpio;
-    char fname[FILENAME_MAX];
-
-
-    /* write header file */
-
-    if (file_type != NULL)
-        sprintf(fname, "%s.%s.hdr", filename, file_type);
-    else
-        sprintf(fname, "%s.hdr", filename);
-
-    if ((fpio = fopen(fname, "w")) == NULL) {
-        nll_puterr("ERROR: opening grid output header file.");
-        return (-1);
-    }
-    NumFilesOpen++;
-
-    fprintf(fpio, "%d %d %d  %lf %lf %lf  %lf %lf %lf %s",
-            pgrid->numx, pgrid->numy, pgrid->numz,
-            pgrid->origx, pgrid->origy, pgrid->origz,
-            pgrid->dx, pgrid->dy, pgrid->dz, pgrid->chr_type);
-
-#ifdef GRID_FLOAT_TYPE_DOUBLE
-    fprintf(fpio, " DOUBLE\n");
-#else
-    fprintf(fpio, " FLOAT\n");
-#endif
-
-    if (pgrid->type == GRID_TIME || pgrid->type == GRID_TIME_2D
-            || pgrid->type == GRID_ANGLE || pgrid->type == GRID_ANGLE_2D
-            || pgrid->type == GRID_INCLINATION || pgrid->type == GRID_INCLINATION_2D
-            )
-        fprintf(fpio, "%s %lf %lf %lf\n",
-            psrce->label, psrce->x, psrce->y, psrce->z);
-
-    fprintf(fpio, "%s\n", MapProjStr[0]);
-
-
-    fclose(fpio);
-    NumFilesOpen--;
-
-    return (0);
-}
-
 /** function to generate a grid from an OctTree structure */
 
-int ConvertOctTree2Grid(Tree3D* tree, double dx, double dy, double dz, char *grid_type, GridDesc *pgrid_out) {
+int ConvertOctTree2Grid(Tree3D* tree, double dx, double dy, double dz, char *grid_type, GridDesc * pgrid_out) {
 
     int ix, iy, iz;
     Vect3D coords;
@@ -1401,6 +1771,7 @@ int ConvertOctTree2Grid(Tree3D* tree, double dx, double dy, double dz, char *gri
                 coords.y -= dy / 1000.0;
             coords.z = pgrid_out->origz;
             for (iz = 0; iz < pgrid_out->numz; iz++) {
+
                 if (iz == pgrid_out->numz - 1)
                     coords.z -= dz / 1000.0;
                 node = getLeafNodeContaining(tree, coords);
@@ -1420,9 +1791,9 @@ int ConvertOctTree2Grid(Tree3D* tree, double dx, double dy, double dz, char *gri
 
 /** function to swap bytes in grid buffer ***/
 
-int swapBytes(float *buffer, long bufsize) {
+int swapBytes(GRID_FLOAT_TYPE *buffer, long bufsize) {
 
-    float *bufpos;
+    GRID_FLOAT_TYPE *bufpos;
     char ctmp;
     unsigned short itmp;
 
@@ -1436,6 +1807,7 @@ int swapBytes(float *buffer, long bufsize) {
 
     bufpos = buffer;
     while (bufpos < buffer + bufsize) {
+
         bufval.fval = *bufpos;
         ctmp = bufval.cval[0];
         bufval.cval[0] = bufval.cval[1];
@@ -1455,24 +1827,26 @@ int swapBytes(float *buffer, long bufsize) {
 
 /** function to read entire grid buffer from disk ***/
 
-int ReadGrid3dBuf(GridDesc* pgrid, FILE* fpio) {
+int ReadGrid3dBuf(GridDesc* pgrid, FILE * fpio) {
 
     long readsize;
 
 
 
-    readsize = pgrid->numx * pgrid->numy * pgrid->numz * sizeof (GRID_FLOAT_TYPE);
+    // 20161021 AJL  readsize = pgrid->numx * pgrid->numy * pgrid->numz * sizeof (GRID_FLOAT_TYPE);
+    readsize = pgrid->buffer_size;
 
     /* read from grid file to buffer */
 
-    if (fread((char *) pgrid->buffer, readsize, 1, fpio) != 1) {
+    int ireturn;
+    if ((ireturn = fread((char *) pgrid->buffer, readsize, 1, fpio)) != 1) {
+        printf("DEBUG: pgrid->buffer %ld, readsize %ld, fpio %ld, ireturn %d\n", (long) pgrid->buffer, readsize, (long) fpio, ireturn);
         nll_puterr2("ERROR: reading grid file", pgrid->title);
         return (-1);
     }
 
     if (pgrid->iSwapBytes)
         swapBytes(pgrid->buffer, readsize / sizeof (float));
-
 
     return (0);
 }
@@ -1515,8 +1889,7 @@ int ReadGrid3dBufSheet(GRID_FLOAT_TYPE* sheetbuf, GridDesc* pgrid_disk,
     }
 
     if (pgrid_disk->iSwapBytes)
-        swapBytes(sheetbuf, readsize / sizeof (float));
-
+        swapBytes(sheetbuf, readsize / sizeof (GRID_FLOAT_TYPE));
 
     return (0);
 }
@@ -1553,6 +1926,50 @@ int ReadGrid3dHdr(GridDesc* pgrid, SourceDesc* psrce, char* filename, char* file
             psrce->label, &(psrce->x), &(psrce->y), &(psrce->z));
 
 
+    //  check for optional header lines
+    char line[MAXLINE_LONG];
+    char tag[MAXLINE_LONG];
+
+    // check for map projection
+    strcpy(pgrid->mapProjStr, "");
+    rewind(fpio);
+    while (fgets(line, MAXLINE_LONG, fpio) != NULL) {
+        int istat = sscanf(line, "%s", tag);
+        if (istat == 1 && strcmp(tag, "TRANSFORM") == 0) {
+            strcpy(pgrid->mapProjStr, line);
+        }
+    }
+
+    // check if cascading grid
+    pgrid->flagGridCascading = IS_NOT_CASCADING;
+    int num_z_merge_depths;
+    rewind(fpio);
+    while (fgets(line, MAXLINE_LONG, fpio) != NULL) {
+        int istat = sscanf(line, "%s %d", tag, &num_z_merge_depths);
+        if (istat == 2 && strcmp(tag, "CASCADING_GRID") == 0) {
+            setCascadingGrid(pgrid);
+            pgrid->gridDesc_Cascading.num_z_merge_depths = num_z_merge_depths;
+            if (pgrid->gridDesc_Cascading.num_z_merge_depths > MAX_NUM_Z_MERGE_DEPTHS) {
+                pgrid->gridDesc_Cascading.num_z_merge_depths = MAX_NUM_Z_MERGE_DEPTHS;
+                sprintf(MsgStr, "ERROR: too many cascading grid Z merge depths, only using first %d depths.",
+                        pgrid->gridDesc_Cascading.num_z_merge_depths);
+                nll_puterr(MsgStr);
+            }
+            // 20170207 AJL - z_merge_depths moved to fixed array to ease memory management
+            //pgrid->gridDesc_Cascading.z_merge_depths = (double*) malloc((size_t) num_z_merge_depths * sizeof (double));
+            char doubling_depths[1024];
+            sscanf(line, "%*s %*d %s", doubling_depths);
+            char *str_pos = strtok(doubling_depths, ",");
+            int n = 0;
+            while (str_pos != NULL) {
+                pgrid->gridDesc_Cascading.z_merge_depths[n] = atof(str_pos);
+                //printf("DEBUG: CASCADING_GRID doubling depth added: %s %f\n", str_pos, pgrid->gridDesc_Cascading.z_merge_depths[n]);
+                n++;
+                str_pos = strtok(NULL, ",");
+            }
+        }
+    }
+
     fclose(fpio);
     NumFilesOpen--;
 
@@ -1561,11 +1978,11 @@ int ReadGrid3dHdr(GridDesc* pgrid, SourceDesc* psrce, char* filename, char* file
 
 /** function to read grid header file grid description line ***/
 
-int ReadGrid3dHdr_grid_description(FILE *fpio, GridDesc* pgrid) {
+int ReadGrid3dHdr_grid_description(FILE *fpio, GridDesc * pgrid) {
 
     char line[MAXLINE_LONG];
     if (fgets(line, MAXLINE_LONG, fpio) == NULL) {
-            nll_puterr("ERROR: reading grid header file.");
+        nll_puterr("ERROR: reading grid header file.");
         return (-1);
     }
     strcpy(pgrid->float_type, "FLOAT");
@@ -1582,6 +1999,7 @@ int ReadGrid3dHdr_grid_description(FILE *fpio, GridDesc* pgrid) {
 #else
     if (strcmp(pgrid->float_type, "FLOAT") != 0) {
         nll_puterr("ERROR: Global grid float type is set to FLOAT, but grid file type is not FLOAT. (see compiler flag GRID_FLOAT_TYPE_DOUBLE)");
+
         return (-1);
     }
 #endif
@@ -1631,6 +2049,10 @@ int OpenGrid3dFile(char *fname, FILE **fp_grid, FILE **fp_hdr,
     NumGridHdrFilesOpen++;
     NumFilesOpen++;
 
+    // initialize key fields
+    pgrid->array = NULL;
+    pgrid->buffer = NULL;
+
 
     /* read header file */
 
@@ -1664,13 +2086,71 @@ int OpenGrid3dFile(char *fname, FILE **fp_grid, FILE **fp_hdr,
     // save filename as grid identifier
     strcpy(pgrid->title, fname);
 
+    //  check for optional header lines
+    char line[MAXLINE_LONG];
+    char tag[MAXLINE_LONG];
+
+    // check for map projection
+    strcpy(pgrid->mapProjStr, "");
+    rewind(*fp_hdr);
+    while (fgets(line, MAXLINE_LONG, *fp_hdr) != NULL) {
+        int istat = sscanf(line, "%s", tag);
+        if (istat == 1 && strcmp(tag, "TRANSFORM") == 0) {
+            strcpy(pgrid->mapProjStr, line);
+        }
+    }
+
+    // check if cascading grid
+    pgrid->flagGridCascading = IS_NOT_CASCADING;
+    int num_z_merge_depths;
+    rewind(*fp_hdr);
+    while (fgets(line, MAXLINE_LONG, *fp_hdr) != NULL) {
+        int istat = sscanf(line, "%s %d", tag, &num_z_merge_depths);
+        if (istat == 2 && strcmp(tag, "CASCADING_GRID") == 0) {
+            setCascadingGrid(pgrid);
+            pgrid->gridDesc_Cascading.num_z_merge_depths = num_z_merge_depths;
+            if (pgrid->gridDesc_Cascading.num_z_merge_depths > MAX_NUM_Z_MERGE_DEPTHS) {
+                pgrid->gridDesc_Cascading.num_z_merge_depths = MAX_NUM_Z_MERGE_DEPTHS;
+                sprintf(MsgStr, "ERROR: too many cascading grid Z merge depths, only using first %d depths.",
+                        pgrid->gridDesc_Cascading.num_z_merge_depths);
+                nll_puterr(MsgStr);
+            }
+            // 20170207 AJL - z_merge_depths moved to fixed array to ease memory management
+            //pgrid->gridDesc_Cascading.z_merge_depths = (double*) malloc((size_t) num_z_merge_depths * sizeof (double));
+            char doubling_depths[1024];
+            sscanf(line, "%*s %*d %s", doubling_depths);
+            char *str_pos = strtok(doubling_depths, ",");
+            int n = 0;
+            while (str_pos != NULL) {
+                pgrid->gridDesc_Cascading.z_merge_depths[n] = atof(str_pos);
+                //printf("DEBUG: CASCADING_GRID doubling depth added: %s %f\n", str_pos, pgrid->gridDesc_Cascading.z_merge_depths[n]);
+                n++;
+                str_pos = strtok(NULL, ",");
+            }
+        }
+    }
+
+
+
     return (0);
 
 }
 
 /** function to close grid file and header ***/
 
-void CloseGrid3dFile(FILE **fp_grid, FILE **fp_hdr) {
+void CloseGrid3dFile(GridDesc* pgrid, FILE **fp_grid, FILE **fp_hdr) {
+
+    // 20170207 AJL - z_merge_depths moved to fixed array to ease memory management
+    /*if (pgrid != NULL) {
+        if (isCascadingGrid(pgrid)) {
+            if (pgrid->gridDesc_Cascading.z_merge_depths != NULL) {
+                free(pgrid->gridDesc_Cascading.z_merge_depths);
+                pgrid->gridDesc_Cascading.z_merge_depths = NULL;
+                NumAllocations--;
+            }
+            pgrid->gridDesc_Cascading.z_merge_depths = NULL;
+        }
+    }*/
 
     if (*fp_grid != NULL) {
         fclose(*fp_grid);
@@ -1693,7 +2173,7 @@ void CloseGrid3dFile(FILE **fp_grid, FILE **fp_hdr) {
  *  The required grids must be present as *.buf and *.hyp disk files.
  */
 
-GRID_FLOAT_TYPE* ReadGridFile
+GRID_FLOAT_TYPE * ReadGridFile
 (
         // calling parameters
         GRID_FLOAT_TYPE* values, // GRID_FLOAT_TYPE array to return grid values, must be of size nvalues or larger
@@ -1734,22 +2214,310 @@ GRID_FLOAT_TYPE* ReadGridFile
         // 3D grid
         for (i = 0; i < nvalues; i++) {
             // get GRID_FLOAT_TYPE value on grid
-            values[i] = ReadAbsInterpGrid3d(fp_grid, &gdesc, xloc[i], yloc[i], zloc[i]);
+            values[i] = ReadAbsInterpGrid3d(fp_grid, &gdesc, xloc[i], yloc[i], zloc[i], 0);
         }
     }
 
 
     // close grid file
-    CloseGrid3dFile(&fp_grid, &fp_hdr);
-
+    CloseGrid3dFile(&gdesc, &fp_grid, &fp_hdr);
 
     return (values);
 
 }
 
+/** function to read cascading grid data from disk or array at index location
+ *
+ * 20161019 AJL - added
+ *
+ *  ix_casc, iy_casc, iz_casc are indices in cascading grid index units
+ */
+
+GRID_FLOAT_TYPE ReadCascadingGrid3dValue(FILE *fpgrid, int ix_casc, int iy_casc, int iz_casc, GridDesc * pgrid) {
+
+    long offset;
+    GRID_FLOAT_TYPE fvalue;
+
+    // get fvalue
+    if (fpgrid != NULL) {
+        // calculate offset in bytes from array offset
+        offset = ((GRID_FLOAT_TYPE **) pgrid->array[ix_casc][iy_casc] + (long) iz_casc) - (GRID_FLOAT_TYPE **) pgrid->array[0][0];
+        offset *= sizeof (GRID_FLOAT_TYPE);
+        //offset *= 2;
+        //if (ix_casc < 4 && iy_casc < 4 && iz_casc < 4)
+        //    printf("ixyz %d,%d,%d  ixyz_casc %d,%d,%d  offset %ld/%ld = (GRID_FLOAT_TYPE **) pgrid->array[ix_casc][iy_casc] %ld + iz_casc %d - (GRID_FLOAT_TYPE **) pgrid->array[0][0] %ld\n",
+        //       ix, iy, iz, ix_casc, iy_casc, iz_casc, offset, offset * sizeof (GRID_FLOAT_TYPE), (GRID_FLOAT_TYPE **) pgrid->array[ix_casc][iy_casc], iz_casc, (GRID_FLOAT_TYPE **) pgrid->array[0][0]);
+        fseek(fpgrid, offset, SEEK_SET);
+        // read fvalue
+        if (fread(&fvalue, sizeof (GRID_FLOAT_TYPE), 1, fpgrid) != 1) {
+            sprintf(MsgStr, "ERROR: reading cascading grid value at: x%d y%d z%d (offset %ld buf_size %ld diff %ld) in: %s",
+                    ix_casc, iy_casc, iz_casc, offset, pgrid->buffer_size, offset - pgrid->buffer_size, pgrid->title);
+            nll_puterr(MsgStr);
+            return (-VERY_LARGE_FLOAT);
+        }
+        if (pgrid->iSwapBytes)
+            swapBytes(&fvalue, 1);
+    } else {
+        fvalue = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix_casc][iy_casc][iz_casc];
+    }
+
+    return (fvalue);
+}
+
+/** function to read cascading grid data from disk or array at interpolated point corresponding to regular grid index location
+ *
+ * 20161021 AJL - added
+ *
+ *  ix_dbl, iy_dbl, iz_dbl are indices in virtual, regular grid equivalent to this cascading grid
+ */
+
+GRID_FLOAT_TYPE ReadGrid3dValue_Cascading_Interp(FILE *fpgrid, double ix_dbl, double iy_dbl, double iz_dbl, GridDesc * pgrid, int clean_casc_allocs) {
+
+    int ix = (int) ix_dbl;
+    int iy = (int) iy_dbl;
+    int iz = (int) iz_dbl;
+
+    // check indexes in range
+    // ix, iy, iz are indices in virtual, regular grid equivalent to this cascading grid
+    if (ix < 0 || ix >= pgrid->numx || iy < 0 || iy >= pgrid->numy || iz < 0 || iz >= pgrid->numz) {
+        //nll_puterr("WARNING: grid file index out of range.");
+        return (-VERY_LARGE_FLOAT);
+    }
+
+    // need grid array to find offset
+    int created_grid_array_cascading = 0;
+    int allocated_grid_cascading = 0;
+    if (pgrid->array == NULL) {
+        if (pgrid->buffer == NULL) {
+            // prepare grid memory without allocating buffer, required to initialize cascading grid array
+            AllocateGrid_Cascading(pgrid, 0);
+            allocated_grid_cascading = 1;
+        }
+        pgrid->array = CreateGridArray_Cascading(pgrid);
+        created_grid_array_cascading = 1;
+    }
+
+    int xyz_scale = pgrid->gridDesc_Cascading.xyz_scale[iz];
+
+    // set upper x,y,z indices in cascading grid
+    int iz0_casc = pgrid->gridDesc_Cascading.zindex[iz];
+    int ix0_casc = ix / xyz_scale;
+    int iy0_casc = iy / xyz_scale;
+
+
+    // interpolate within cascading grid cell
+
+    // check if at change in grid cell size, gets complicated...
+    int xy_scale_use = xyz_scale;
+    int ix0_casc_up, iy0_casc_up, ix0_casc_dn, iy0_casc_dn;
+    int ix1_casc_up, iy1_casc_up, ix1_casc_dn, iy1_casc_dn;
+    int iz1_casc;
+    int irescale = 0;
+    if (iz < pgrid->numz - 2) {
+        // find first regular z index in next cascading grid level
+        int iz_test = iz + 1;
+        // 20170207 AJL while (iz_test < pgrid->numz && pgrid->gridDesc_Cascading.zindex[iz_test] == iz0_casc) {
+        while (iz_test < pgrid->numz - 1 && pgrid->gridDesc_Cascading.zindex[iz_test] == iz0_casc) {
+            iz_test++;
+        }
+        // check if scale changes in next cascading grid level
+        irescale = pgrid->gridDesc_Cascading.xyz_scale[iz_test] > xyz_scale;
+    }
+    if (irescale) { // change of grid size
+        //printf("DEBUG: rescale! iz %d scale %d, iz+1 %d, scale %d\n",iz, xyz_scale, iz + 1, pgrid->gridDesc_Cascading.xyz_scale[iz + 1]);
+        xy_scale_use = 2 * xyz_scale;
+        // set upper and lower x,y indices in cascading grid
+        // x
+        // make sure upper values are at even index, align with cell below
+        ix0_casc_up = 2 * (ix0_casc / 2);
+        // upper index increases by 2
+        ix1_casc_up = ix0_casc_up + 2;
+        int ixmax = (pgrid->numx - 1) / xyz_scale + ((pgrid->numx - 1) % xyz_scale == 0 ? 0 : 1); // includes fractional final casc grid node if xyz_scale != 1
+        if (ix1_casc_up > ixmax) {
+            ix1_casc_up = ixmax;
+        }
+        // lower index in larger cell size increases by 1
+        ix0_casc_dn = ix0_casc_up / 2;
+        ix1_casc_dn = ix0_casc_dn + 1;
+        ixmax = (pgrid->numx - 1) / xy_scale_use + ((pgrid->numx - 1) % xy_scale_use == 0 ? 0 : 1); // includes fractional final casc grid node if xyz_scale != 1
+        if (ix1_casc_dn > ixmax) {
+            ix1_casc_dn = ixmax;
+        }
+        // y
+        // make sure upper values are at even index, align with cell below
+        iy0_casc_up = 2 * (iy0_casc / 2);
+        // upper index increases by 2
+        iy1_casc_up = iy0_casc_up + 2;
+        int iymax = (pgrid->numy - 1) / xyz_scale + ((pgrid->numy - 1) % xyz_scale == 0 ? 0 : 1); // includes fractional final casc grid node if xyz_scale != 1
+        if (iy1_casc_up > iymax) {
+            iy1_casc_up = iymax;
+        }
+        // lower index in larger cell size increases by 1
+        iy0_casc_dn = iy0_casc_up / 2;
+        iy1_casc_dn = iy0_casc_dn + 1;
+        iymax = (pgrid->numy - 1) / xy_scale_use + ((pgrid->numy - 1) % xy_scale_use == 0 ? 0 : 1); // includes fractional final casc grid node if xyz_scale != 1
+        if (iy1_casc_dn > iymax) {
+            iy1_casc_dn = iymax;
+        }
+    } else {
+        // set upper and lower x,y indices in cascading grid
+        // x
+        ix0_casc_up = ix0_casc_dn = ix0_casc;
+        ix1_casc_up = ix0_casc + 1;
+        if (ix1_casc_up >= pgrid->numx) {
+            ix1_casc_up = pgrid->numx - 1;
+        }
+        ix1_casc_dn = ix1_casc_up;
+        // y
+        iy0_casc_up = iy0_casc_dn = iy0_casc;
+        iy1_casc_up = iy0_casc + 1;
+        if (iy1_casc_up >= pgrid->numy) {
+            iy1_casc_up = pgrid->numy - 1;
+        }
+        iy1_casc_dn = iy1_casc_up;
+    }
+    iz1_casc = iz0_casc + 1;
+    if (iz1_casc > pgrid->gridDesc_Cascading.zindex[pgrid->numz - 1]) {
+        iz1_casc = pgrid->gridDesc_Cascading.zindex[pgrid->numz - 1];
+    }
+
+
+    DOUBLE xdiff, ydiff, zdiff;
+    // x
+    int lastx = ((pgrid->numx - 1) / xy_scale_use) * xy_scale_use; // reg index of end of last full casc grid cell
+    if (ix > lastx) { // casc grid cell is truncated in x relative to cell of size xy_scale_use reg grid cells
+        xdiff = (ix_dbl - (DOUBLE) lastx) / (DOUBLE) (pgrid->numx - 1 - lastx);
+        if (ix0_casc_up != ix0_casc_dn && iy == 133) {
+            printf("xy_scale_use %d, xdiff %f = (DOUBLE) (ix %d - lastx %d) / (DOUBLE) (pgrid->numx %d - 1 - lastx %d)\n", xy_scale_use, xdiff, ix, lastx, pgrid->numx, lastx);
+            printf("ix0_casc_up/dn %d/%d, ix1_casc_up/dn %d/%d, iz0_casc %d, iz1_casc %d\n", ix0_casc_up, ix0_casc_dn, ix1_casc_up, ix1_casc_dn, iz0_casc, iz1_casc);
+            printf("iy0_casc_up %d, iy0_casc_dn %d, iy1_casc_up %d, iy1_casc_dn %d, iz0_casc %d, iz1_casc %d\n", iy0_casc_up, iy0_casc_dn, iy1_casc_up, iy1_casc_dn, iz0_casc, iz1_casc);
+        }
+    } else {
+        //xdiff = (DOUBLE) (ix % xy_scale_use) / (DOUBLE) xy_scale_use;
+        xdiff = fmod(ix_dbl, (DOUBLE) xy_scale_use) / (DOUBLE) xy_scale_use;
+    }
+    // y
+    int lasty = ((pgrid->numy - 1) / xy_scale_use) * xy_scale_use; // reg index of end of last full casc grid cell
+    if (iy > lasty) { // casc grid cell is truncated in y relative to cell of size xy_scale_use reg grid cells
+        ydiff = (iy_dbl - (DOUBLE) lasty) / (DOUBLE) (pgrid->numy - 1 - lasty);
+        //printf("xy_scale_use %d, ydiff %f = (DOUBLE) (iy %d - lasty %d) / (DOUBLE) (pgrid->numy %d - 1 - lasty %d)\n", xy_scale_use, ydiff, iy, lasty, pgrid->numy, lasty);
+    } else {
+        //ydiff = (DOUBLE) (iy % xy_scale_use) / (DOUBLE) xy_scale_use;
+        ydiff = fmod(iy_dbl, (DOUBLE) xy_scale_use) / (DOUBLE) xy_scale_use;
+    }
+    //xdiff = (DOUBLE) (ix % xy_scale_use) / (DOUBLE) xy_scale_use;
+    //ydiff = (DOUBLE) (iy % xy_scale_use) / (DOUBLE) xy_scale_use;
+    // find regular grid z steps to reach upper limit
+    int iz_test = iz;
+    while (iz_test > 0 && pgrid->gridDesc_Cascading.zindex[iz_test - 1] == iz0_casc) {
+        iz_test--;
+    }
+    // 20161026  zdiff = (DOUBLE) (iz - iz_test) / (DOUBLE) xy_scale_use;
+    zdiff = (iz_dbl - (DOUBLE) iz_test) / (DOUBLE) xyz_scale;
+
+    GRID_FLOAT_TYPE value;
+
+    if (xdiff < 0.0 || xdiff > 1.0) {
+        value = -VERY_LARGE_FLOAT;
+        goto cleanup;
+    }
+    if (ydiff < 0.0 || ydiff > 1.0) {
+        value = -VERY_LARGE_FLOAT;
+        goto cleanup;
+    }
+    if (zdiff < 0.0 || zdiff > 1.0) {
+        value = -VERY_LARGE_FLOAT;
+        goto cleanup;
+    }
+
+    // location at grid node
+    /*if (xdiff + ydiff + zdiff < SMALL_FLOAT) {
+        value = ReadCascadingGrid3dValue(fpgrid, ix0_casc, iy0_casc, iz0_casc, pgrid);
+        return (value);
+    }*/
+
+    DOUBLE vval000, vval001, vval010, vval011, vval100, vval101, vval110, vval111;
+    vval000 = ReadCascadingGrid3dValue(fpgrid, ix0_casc_up, iy0_casc_up, iz0_casc, pgrid);
+    vval001 = ReadCascadingGrid3dValue(fpgrid, ix0_casc_dn, iy0_casc_dn, iz1_casc, pgrid);
+    vval010 = ReadCascadingGrid3dValue(fpgrid, ix0_casc_up, iy1_casc_up, iz0_casc, pgrid);
+    vval011 = ReadCascadingGrid3dValue(fpgrid, ix0_casc_dn, iy1_casc_dn, iz1_casc, pgrid);
+    vval100 = ReadCascadingGrid3dValue(fpgrid, ix1_casc_up, iy0_casc_up, iz0_casc, pgrid);
+    vval101 = ReadCascadingGrid3dValue(fpgrid, ix1_casc_dn, iy0_casc_dn, iz1_casc, pgrid);
+    vval110 = ReadCascadingGrid3dValue(fpgrid, ix1_casc_up, iy1_casc_up, iz0_casc, pgrid);
+    vval111 = ReadCascadingGrid3dValue(fpgrid, ix1_casc_dn, iy1_casc_dn, iz1_casc, pgrid);
+
+    // check for invalid / mask nodes
+    if (vval000 < 0.0 || vval010 < 0.0 || vval100 < 0.0 || vval110 < 0.0
+            || vval001 < 0.0 || vval011 < 0.0 || vval101 < 0.0 || vval111 < 0.0) {
+        value = -VERY_LARGE_FLOAT;
+        goto cleanup;
+    }
+    value = InterpCubeLagrange(xdiff, ydiff, zdiff,
+            vval000, vval001, vval010, vval011,
+            vval100, vval101, vval110, vval111);
+
+cleanup:
+
+    // clean up
+    if (clean_casc_allocs) {
+        if (allocated_grid_cascading) {
+            FreeGrid_Cascading(pgrid);
+        }
+        if (created_grid_array_cascading) {
+            DestroyGridArray(pgrid);
+        }
+    }
+
+    return (value);
+}
+
+/** function to read cascading grid data from disk or array at upper xyz indices corresponding to regular grid index location
+ *
+ * 20161019 AJL - added
+ *
+ *  ix, iy, iz are indices in virtual, regular grid equivalent to this cascading grid
+ */
+
+GRID_FLOAT_TYPE ReadGrid3dValue_Cascading(FILE *fpgrid, int ix, int iy, int iz, GridDesc * pgrid) {
+
+    // check indexes in range
+    // ix, iy, iz are indices in virtual, regular grid equivalent to this cascading grid
+    if (ix < 0 || ix >= pgrid->numx || iy < 0 || iy >= pgrid->numy || iz < 0 || iz >= pgrid->numz) {
+        //nll_puterr("WARNING: grid file index out of range.");
+        return (-VERY_LARGE_FLOAT);
+    }
+
+    // need grid array to find offset
+    if (pgrid->array == NULL) {
+        if (pgrid->buffer == NULL) {
+            // prepare grid memory without allocating buffer, required to initialize cascading grid array
+            AllocateGrid_Cascading(pgrid, 0);
+        }
+        pgrid->array = CreateGridArray_Cascading(pgrid);
+    }
+
+    // set x,y,z indices in cascading grid
+    int iz_casc = pgrid->gridDesc_Cascading.zindex[iz];
+    int ix_casc = ix / pgrid->gridDesc_Cascading.xyz_scale[iz];
+    int iy_casc = iy / pgrid->gridDesc_Cascading.xyz_scale[iz];
+
+
+    // get fvalue
+    GRID_FLOAT_TYPE fvalue = ReadCascadingGrid3dValue(fpgrid, ix_casc, iy_casc, iz_casc, pgrid);
+
+    return (fvalue);
+}
+
 /** function to read grid data from disk or array at index location ***/
 
-INLINE GRID_FLOAT_TYPE ReadGrid3dValue(FILE *fpgrid, int ix, int iy, int iz, GridDesc* pgrid) {
+GRID_FLOAT_TYPE ReadGrid3dValue(FILE *fpgrid, int ix, int iy, int iz, GridDesc * pgrid, int clean_casc_allocs) {
+
+    if (isCascadingGrid(pgrid)) {
+        //return (ReadGrid3dValue_Cascading(fpgrid, ix, iy, iz, pgrid));
+        return (ReadGrid3dValue_Cascading_Interp(fpgrid, (double) ix, (double) iy, (double) iz, pgrid, clean_casc_allocs));
+    }
+
+
     int numyz;
     long offset;
     GRID_FLOAT_TYPE fvalue;
@@ -1771,13 +2539,15 @@ INLINE GRID_FLOAT_TYPE ReadGrid3dValue(FILE *fpgrid, int ix, int iy, int iz, Gri
         fseek(fpgrid, offset, SEEK_SET);
         /* read fvalue */
         if (fread(&fvalue, sizeof (GRID_FLOAT_TYPE), 1, fpgrid) != 1) {
-            nll_puterr2("ERROR: reading grid file", pgrid->title);
+            nll_puterr2("ERROR: reading grid value", pgrid->title);
             return (-VERY_LARGE_FLOAT);
         }
         if (pgrid->iSwapBytes)
             swapBytes(&fvalue, 1);
-    } else
+    } else {
+
         fvalue = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix][iy][iz];
+    }
 
 
     return (fvalue);
@@ -1785,7 +2555,7 @@ INLINE GRID_FLOAT_TYPE ReadGrid3dValue(FILE *fpgrid, int ix, int iy, int iz, Gri
 
 /** function to read grid data from disk or array at absolute location ***/
 
-INLINE GRID_FLOAT_TYPE ReadAbsGrid3dValue(FILE *fpgrid, GridDesc* pgrid,
+GRID_FLOAT_TYPE ReadAbsGrid3dValue(FILE *fpgrid, GridDesc* pgrid,
         double xloc, double yloc, double zloc, int ifloor) {
     int ix, iy, iz;
     GRID_FLOAT_TYPE fvalue;
@@ -1807,8 +2577,7 @@ INLINE GRID_FLOAT_TYPE ReadAbsGrid3dValue(FILE *fpgrid, GridDesc* pgrid,
 
     /* read grid data */
 
-    fvalue = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid);
-
+    fvalue = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid, 0);
 
     return (fvalue);
 }
@@ -1821,7 +2590,7 @@ INLINE GRID_FLOAT_TYPE ReadAbsGrid3dValue(FILE *fpgrid, GridDesc* pgrid,
 
 /*	returns interp value at (xdiff, ydiff, zdiff) */
 
-INLINE DOUBLE InterpCubeLagrange(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
+DOUBLE InterpCubeLagrange(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
         DOUBLE vval000, DOUBLE vval001, DOUBLE vval010, DOUBLE vval011,
         DOUBLE vval100, DOUBLE vval101, DOUBLE vval110, DOUBLE vval111) {
 
@@ -1834,14 +2603,23 @@ INLINE DOUBLE InterpCubeLagrange(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
     oneMinusYdiff = 1.0 - ydiff;
     oneMinusZdiff = 1.0 - zdiff;
 
-    value = vval000 * (oneMinusXdiff) * (oneMinusYdiff) * (oneMinusZdiff)
+    /*value = vval000 * (oneMinusXdiff) * oneMinusYdiff * (oneMinusZdiff)
             + vval001 * (oneMinusXdiff) * (oneMinusYdiff) * zdiff
             + vval010 * (oneMinusXdiff) * ydiff * (oneMinusZdiff)
             + vval011 * (oneMinusXdiff) * ydiff * zdiff
             + vval100 * xdiff * (oneMinusYdiff) * (oneMinusZdiff)
             + vval101 * xdiff * (oneMinusYdiff) * zdiff
             + vval110 * xdiff * ydiff * (oneMinusZdiff)
-            + vval111 * xdiff * ydiff * zdiff;
+            + vval111 * xdiff * ydiff * zdiff;*/
+
+    value = oneMinusXdiff * (
+            oneMinusYdiff * (vval000 * oneMinusZdiff + vval001 * zdiff)
+            + ydiff * (vval010 * oneMinusZdiff + vval011 * zdiff)
+            )
+            + xdiff * (
+            oneMinusYdiff * (vval100 * oneMinusZdiff + vval101 * zdiff)
+            + ydiff * (vval110 * oneMinusZdiff + vval111 * zdiff)
+            );
 
     return (value);
 
@@ -1849,7 +2627,7 @@ INLINE DOUBLE InterpCubeLagrange(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
 
 /** function to find angles inside a cube */
 
-INLINE float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
+float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
         DOUBLE vval000, DOUBLE vval001, DOUBLE vval010, DOUBLE vval011,
         DOUBLE vval100, DOUBLE vval101, DOUBLE vval110, DOUBLE vval111) {
 
@@ -1858,6 +2636,7 @@ INLINE float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
     int iqual[2][2][2], iqual_low;
     float value;
     TakeOffAngles angles;
+    double azim_ref, azim_test;
 
 
     /* decode angles on vertices of cube */
@@ -1888,16 +2667,27 @@ INLINE float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
             &(azim[1][1][1]), &(dip[1][1][1]), &(iqual[1][1][1]));
 
 
-    /* check for lowest quality angles */
+    // check for lowest quality angles
+    // 20130823 AJL - bug fix:
+    //    correct azimuths to avoid discontinuity at 0/360 deg
 
     iqual_low = 999;
-    for (nx = 0; nx < 2; nx++)
-        for (ny = 0; ny < 2; ny++)
+    azim_ref = azim[0][0][0];
+    for (nx = 0; nx < 2; nx++) {
+        for (ny = 0; ny < 2; ny++) {
             for (nz = 0; nz < 2; nz++) {
                 //printf("%d %d %d az %f dip %f q %d\n", nx, ny, nz, azim[nx][ny][nz], dip[nx][ny][nz], iqual[nx][ny][nz]);
                 if (iqual[nx][ny][nz] < iqual_low)
                     iqual_low = iqual[nx][ny][nz];
+                azim_test = azim[nx][ny][nz] - azim_ref;
+                if (azim_test < -90.0) {
+                    azim[nx][ny][nz] += 360.0;
+                } else if (azim_test > 90.0) {
+                    azim[nx][ny][nz] -= 360.0;
+                }
             }
+        }
+    }
 
 
     /* determine angles to return */
@@ -1911,6 +2701,13 @@ INLINE float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
                 azim[0][0][0], azim[0][0][1], azim[0][1][0],
                 azim[0][1][1], azim[1][0][0], azim[1][0][1],
                 azim[1][1][0], azim[1][1][1]);
+        // 20130823 AJL - bug fix:
+        if (azim_interp < 0.0) {
+            azim_interp += 360.0;
+        } else if (azim_interp > 360.0) {
+
+            azim_interp -= 360.0;
+        }
         dip_interp = InterpCubeLagrange(xdiff, ydiff, zdiff,
                 dip[0][0][0], dip[0][0][1], dip[0][1][0],
                 dip[0][1][1], dip[1][0][0], dip[1][0][1],
@@ -1932,14 +2729,22 @@ INLINE float InterpCubeAngles(DOUBLE xdiff, DOUBLE ydiff, DOUBLE zdiff,
 
 /* read from file if fpgrid != NULL, otherwise read from grid buffer */
 
-INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double xloc, double yloc, double zloc) {
+GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double xloc, double yloc, double zloc, int clean_casc_allocs) {
+
+    DOUBLE xoff, yoff, zoff;
+    xoff = (xloc - pgrid->origx) / pgrid->dx;
+    yoff = (yloc - pgrid->origy) / pgrid->dy;
+    zoff = (zloc - pgrid->origz) / pgrid->dz;
+
+    // check if cascading grid
+    if (isCascadingGrid(pgrid)) {
+        return (ReadGrid3dValue_Cascading_Interp(fpgrid, xoff, yoff, zoff, pgrid, clean_casc_allocs));
+    }
+
     int ix0, ix1, iy0, iy1, iz0, iz1;
     GRID_FLOAT_TYPE value;
     DOUBLE vval000, vval001, vval010, vval011, vval100, vval101, vval110, vval111;
-
-    DOUBLE xoff, yoff, zoff;
     DOUBLE xdiff, ydiff, zdiff;
-
     int numx, numy, numz, numyz;
     GRID_FLOAT_TYPE *buffer;
 
@@ -1952,11 +2757,8 @@ INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double
 
     /* calculate grid locations on edge of solid containing point */
 
-    xoff = (xloc - pgrid->origx) / pgrid->dx;
     ix0 = (int) (xoff - VERY_SMALL_DOUBLE);
-    yoff = (yloc - pgrid->origy) / pgrid->dy;
     iy0 = (int) (yoff - VERY_SMALL_DOUBLE);
-    zoff = (zloc - pgrid->origz) / pgrid->dz;
     iz0 = (int) (zoff - VERY_SMALL_DOUBLE);
 
     ix1 = (ix0 < numx - 1) ? ix0 + 1 : ix0;
@@ -1995,7 +2797,7 @@ INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double
 
     if (xdiff + ydiff + zdiff < SMALL_FLOAT) {
         if (fpgrid != NULL)
-            value = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid);
+            value = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid, 0);
         else
             value = *(buffer + ix0 * numyz + iy0 * numz + iz0);
         return (value);
@@ -2005,14 +2807,14 @@ INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double
     /* read vertex values from grid file or array */
 
     if (fpgrid != NULL) {
-        vval000 = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid);
-        vval001 = ReadGrid3dValue(fpgrid, ix0, iy0, iz1, pgrid);
-        vval010 = ReadGrid3dValue(fpgrid, ix0, iy1, iz0, pgrid);
-        vval011 = ReadGrid3dValue(fpgrid, ix0, iy1, iz1, pgrid);
-        vval100 = ReadGrid3dValue(fpgrid, ix1, iy0, iz0, pgrid);
-        vval101 = ReadGrid3dValue(fpgrid, ix1, iy0, iz1, pgrid);
-        vval110 = ReadGrid3dValue(fpgrid, ix1, iy1, iz0, pgrid);
-        vval111 = ReadGrid3dValue(fpgrid, ix1, iy1, iz1, pgrid);
+        vval000 = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid, 0);
+        vval001 = ReadGrid3dValue(fpgrid, ix0, iy0, iz1, pgrid, 0);
+        vval010 = ReadGrid3dValue(fpgrid, ix0, iy1, iz0, pgrid, 0);
+        vval011 = ReadGrid3dValue(fpgrid, ix0, iy1, iz1, pgrid, 0);
+        vval100 = ReadGrid3dValue(fpgrid, ix1, iy0, iz0, pgrid, 0);
+        vval101 = ReadGrid3dValue(fpgrid, ix1, iy0, iz1, pgrid, 0);
+        vval110 = ReadGrid3dValue(fpgrid, ix1, iy1, iz0, pgrid, 0);
+        vval111 = ReadGrid3dValue(fpgrid, ix1, iy1, iz1, pgrid, 0);
     } else {
         /*
         vval000 = pgrid->array[ix0][iy0][iz0];
@@ -2045,6 +2847,7 @@ INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double
         // check for invalid / mask nodes
         if (vval000 < 0.0 || vval010 < 0.0 || vval100 < 0.0 || vval110 < 0.0
                 || vval001 < 0.0 || vval011 < 0.0 || vval101 < 0.0 || vval111 < 0.0)
+
             return (-VERY_LARGE_FLOAT);
         value = InterpCubeLagrange(xdiff, ydiff, zdiff,
                 vval000, vval001, vval010, vval011,
@@ -2062,7 +2865,7 @@ INLINE GRID_FLOAT_TYPE ReadAbsInterpGrid3d(FILE *fpgrid, GridDesc* pgrid, double
 
 /* read from file if fpgrid != NULL, otherwise read from grid buffer */
 
-INLINE DOUBLE ReadAbsInterpGrid2d(FILE *fpgrid, GridDesc* pgrid, double yloc, double zloc) {
+DOUBLE ReadAbsInterpGrid2d(FILE *fpgrid, GridDesc* pgrid, double yloc, double zloc) {
 
     int ix0, ix1, iy0, iy1, iz0, iz1;
     DOUBLE value;
@@ -2119,7 +2922,7 @@ INLINE DOUBLE ReadAbsInterpGrid2d(FILE *fpgrid, GridDesc* pgrid, double yloc, do
 
     if (ydiff + zdiff < SMALL_FLOAT) {
         if (fpgrid != NULL)
-            value = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid);
+            value = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid, 0);
         else
             value = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix0][iy0][iz0];
         return (value);
@@ -2129,10 +2932,10 @@ INLINE DOUBLE ReadAbsInterpGrid2d(FILE *fpgrid, GridDesc* pgrid, double yloc, do
     /* read vertex values from grid file or array */
 
     if (fpgrid != NULL) {
-        vval00 = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid);
-        vval01 = ReadGrid3dValue(fpgrid, ix0, iy0, iz1, pgrid);
-        vval10 = ReadGrid3dValue(fpgrid, ix0, iy1, iz0, pgrid);
-        vval11 = ReadGrid3dValue(fpgrid, ix0, iy1, iz1, pgrid);
+        vval00 = ReadGrid3dValue(fpgrid, ix0, iy0, iz0, pgrid, 0);
+        vval01 = ReadGrid3dValue(fpgrid, ix0, iy0, iz1, pgrid, 0);
+        vval10 = ReadGrid3dValue(fpgrid, ix0, iy1, iz0, pgrid, 0);
+        vval11 = ReadGrid3dValue(fpgrid, ix0, iy1, iz1, pgrid, 0);
     } else {
         vval00 = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix0][iy0][iz0];
         vval01 = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix0][iy0][iz1];
@@ -2157,18 +2960,17 @@ INLINE DOUBLE ReadAbsInterpGrid2d(FILE *fpgrid, GridDesc* pgrid, double yloc, do
     value = InterpSquareLagrange(ydiff, zdiff,
             vval00, vval01, vval10, vval11);
 
-
     return (value);
 }
 
 
-/** function to find value inside a square using Lagrange interpolation***/
+/** function to find value inside a square using Lagrange interpolation */
 
 /* 	0.0 <= vvalKLM <= 1.0 */
 
 /*	returns interp value at (xdiff, zdiff) */
 
-INLINE DOUBLE InterpSquareLagrange(DOUBLE xdiff, DOUBLE zdiff,
+DOUBLE InterpSquareLagrange(DOUBLE xdiff, DOUBLE zdiff,
         DOUBLE vval00, DOUBLE vval01, DOUBLE vval10, DOUBLE vval11) {
 
     DOUBLE value;
@@ -2177,6 +2979,7 @@ INLINE DOUBLE InterpSquareLagrange(DOUBLE xdiff, DOUBLE zdiff,
             + vval01 * (1.0 - xdiff) * zdiff
             + vval10 * xdiff * (1.0 - zdiff)
             + vval11 * xdiff * zdiff;
+
     return (value);
 
 }
@@ -2187,6 +2990,7 @@ int WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
         int narrivals, char* filename,
         int iWriteArrivals, int iWriteEndLoc, int iWriteMinimal,
         GridDesc* pgrid, int n_proj) {
+
     return (_WriteLocation(fpio, phypo, parrivals,
             narrivals, filename,
             iWriteArrivals, iWriteEndLoc, iWriteMinimal,
@@ -2199,6 +3003,7 @@ int WritePhases(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
         int narrivals, char* filename,
         int iWriteArrivals, int iWriteEndLoc, int iWriteMinimal,
         GridDesc* pgrid, int n_proj, int io_arrival_mode) {
+
     return (_WriteLocation(fpio, phypo, parrivals,
             narrivals, filename,
             iWriteArrivals, iWriteEndLoc, iWriteMinimal,
@@ -2247,25 +3052,28 @@ int _WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
                 -1, -1, -1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "NULLGRID");
         fprintf(fpio, "SEARCH %s\n", phypo->searchInfo);
         fprintf(fpio,
-                "HYPOCENTER  x %f y %f z %f  OT %f  ix %d iy %d iz %d\n",
+                "HYPOCENTER  x %f y %f z %f  OT %f  ix %d iy %d iz %d %s\n",
                 phypo->x, phypo->y, phypo->z, (double) phypo->sec,
-                phypo->ix, phypo->iy, phypo->iz);
+                phypo->ix, phypo->iy, phypo->iz,
+                phypo->type // 20170811 AJL - added to allow saving of expectation hypocenter results instead of maximum likelihood
+                );
     }
     fprintf(fpio,
-            "GEOGRAPHIC  OT %4.4d %2.2d %2.2d  %2.2d %2.2d %9.6lg  Lat %lg Long %lg Depth %lg\n",
+            "GEOGRAPHIC  OT %4.4d %2.2d %2.2d  %2.2d %2.2d %lf  Lat %lf Long %lf Depth %lf\n",
+            // 20151224  "GEOGRAPHIC  OT %4.4d %2.2d %2.2d  %2.2d %2.2d %f  Lat %f Long %f Depth %lg\n",
             //"GEOGRAPHIC  OT %4.4d %2.2d %2.2d  %2.2d %2.2d %lg  Lat %lg Long %lg Depth %lg\n",
             phypo->year, phypo->month, phypo->day,
             phypo->hour, phypo->min, (double) phypo->sec,
             phypo->dlat, phypo->dlong, phypo->depth);
     fprintf(fpio,
-            "QUALITY  Pmax %lg MFmin %lg MFmax %lg RMS %lg Nphs %d Gap %lg Dist %lg Mamp %5.2lg %d Mdur %5.2lg %d\n",
+            "QUALITY  Pmax %Lg MFmin %lg MFmax %lg RMS %lg Nphs %d Gap %lg Dist %lg Mamp %5.2lf %d Mdur %5.2lf %d\n",
             phypo->probmax, phypo->misfit, phypo->grid_misfit_max,
             phypo->rms, phypo->nreadings, phypo->gap,
             GeometryMode == MODE_GLOBAL ? phypo->dist * KM2DEG : phypo->dist,
             phypo->amp_mag, phypo->num_amp_mag,
             phypo->dur_mag, phypo->num_dur_mag
             );
-    
+
     fprintf(fpio,
             "VPVSRATIO  VpVsRatio %lg  Npair %d  Diff %lg\n",
             phypo->VpVs, phypo->nVpVs, phypo->tsp_min_max_diff
@@ -2291,8 +3099,16 @@ int _WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
         fprintf(fpio, " Len3  %le\n", phypo->ellipsoid.len3);
 
         fprintf(fpio,
-                "STAT_GEOG  ExpectLat %lg Long %lg Depth %lg\n",
+                "STAT_GEOG  ExpectLat %lf Long %lf Depth %lf\n",
+                // 20151224  "STAT_GEOG  ExpectLat %f Long %f Depth %f\n",
                 phypo->expect_dlat, phypo->expect_dlong, phypo->expect.z);
+
+        // 20170811 AJL - added to allow saving of expectation hypocenter results instead of maximum likelihood
+        if (strcmp(phypo->type, HYPO_TYPE_EXPECTATION) == 0) {
+            fprintf(fpio,
+                    "MAXIMUM_LIKELIHOOD  MaxLikeLat %lf Long %lf Depth %lf OT %lf\n",
+                    phypo->max_like_dlat, phypo->max_like_dlong, phypo->max_like.z, (double) phypo->max_like_sec);
+        }
 
         fprintf(fpio, "%s\n", MapProjStr[n_proj]);
 
@@ -2341,22 +3157,56 @@ int _WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
                 -1.0, // 20100617 AJL - horizontalUncertainty: not clear what this is, set undefined
                 phypo->ellipse.len1, phypo->ellipse.len2, azMaxHorUnc
                 );
-        
+
+
+        // 20150602 AJL Added new hypo line
+        /*
+        // QML fields added for compatibility with QuakeML ConfidenceEllipsoid attributes (AJL 201005)
+        semiMajorAxisLength Largest uncertainty, corresponding to the semi-major axis of the confidence ellipsoid. Unit: m
+        semiMinorAxisLength Smallest uncertainty, corresponding to the semi-minor axis of the confidence ellipsoid. Unit: m
+        semiIntermediateAxisLength Uncertainty in direction orthogonal to major and minor axes of the confidence ellipsoid. Unit: m
+        majorAxisPlunge Plunge angle of major axis of confidence ellipsoid. Corresponds to Tait-Bryan angle phi. Unit: deg
+        majorAxisAzimuth Azimuth angle of major axis of confidence ellipsoid. Corresponds to Tait-Bryan angle psi. Unit: deg
+        majorAxisRotation This angle describes a rotation about the confidence ellipsoid’s major axis which is required
+           to define the direction of the ellipsoid’s minor axis. Corresponds to Tait-Bryan angle θ. Unit: deg
+         */
+        double semiMajorAxisLength;
+        double semiMinorAxisLength;
+        double semiIntermediateAxisLength;
+        double majorAxisAzimuth;
+        double majorAxisPlunge;
+        double majorAxisRotation;
+        if (nllEllipsiod2QMLConfidenceEllipsoid(
+                &(phypo->ellipsoid),
+                &semiMajorAxisLength, &semiMinorAxisLength, &semiIntermediateAxisLength,
+                &majorAxisAzimuth, &majorAxisPlunge, &majorAxisRotation) < 0) {
+            semiMajorAxisLength = -1.0;
+            semiMinorAxisLength = -1.0;
+            semiIntermediateAxisLength = -1.0;
+            majorAxisAzimuth = -1.0;
+            majorAxisPlunge = -1.0;
+            majorAxisRotation = -1.0;
+        }
+        fprintf(fpio,
+                "QML_ConfidenceEllipsoid  semiMajorAxisLength %lg  semiMinorAxisLength %lg  semiIntermediateAxisLength %lg  majorAxisPlunge %lg  majorAxisAzimuth %lg  majorAxisRotation %lg\n",
+                semiMajorAxisLength, semiMinorAxisLength, semiIntermediateAxisLength, majorAxisPlunge, majorAxisAzimuth, majorAxisRotation
+                );
+
 
         // 20100617 AJL Added new hypo line
         // SED-ETH fields added for compatibility with legacy SED location quality indicators (AJL 201006)
         // SED_Origin errx 33.0775  erry 7.5298  errz 27.5298  diffMaxLikeExpect 4.9584 quality B
         if (phypo->qualitySED != '\0') {
-        fprintf(fpio,
-                "SED_Origin  errx %lg  erry %lg  errz %lg  diffMaxLikeExpect %lg  quality %c\n",
-                sqrt(phypo->cov.xx), sqrt(phypo->cov.yy), sqrt(phypo->cov.zz), phypo->diffMaxLikeExpect, phypo->qualitySED
-                );
+            fprintf(fpio,
+                    "SED_Origin  errx %lg  erry %lg  errz %lg  diffMaxLikeExpect %lg  quality %c\n",
+                    sqrt(phypo->cov.xx), sqrt(phypo->cov.yy), sqrt(phypo->cov.zz), phypo->diffMaxLikeExpect, phypo->qualitySED
+                    );
         }
 
 
         /* write mechanism */
         fprintf(fpio,
-                "FOCALMECH  Hyp  %lg %lg %lg",
+                "FOCALMECH  Hyp  %f %f %f",
                 phypo->dlat, phypo->dlong, phypo->depth);
         fprintf(fpio,
                 " Mech  %lg %lg %lg",
@@ -2368,10 +3218,10 @@ int _WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
 
 
         /* write differential loc parameters */
-        if (nll_mode == MODE_DIFFERENTIAL) {
+        if (nll_mode == MODE_DIFFERENTIAL
+                || phypo->event_id >= 0) { // 20110620 AJL - preserve event id if available
             fprintf(fpio,
-                    "DIFFERENTIAL  Nhyp %ld",
-                    phypo->event_id);
+                    "DIFFERENTIAL  Nhyp %ld", phypo->event_id);
             fprintf(fpio, "\n");
         }
 
@@ -2420,6 +3270,7 @@ int _WriteLocation(FILE *fpio, HypoDesc* phypo, ArrivalDesc* parrivals,
         fprintf(fpio, "END_NLLOC\n\n");
 
     if (ifile) {
+
         fclose(fpio);
         NumFilesOpen--;
     }
@@ -2458,7 +3309,7 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
     }
 
 
-    /* read hypocenter paramters */
+    /* read hypocenter parameters */
 
     /* search for first line of hypocenter description */
     do {
@@ -2536,10 +3387,12 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
         } else if (strncmp(line, "HYPOCENTER", 10) == 0) {
             /* HYPOCENTER */
             if (sscanf(line,
-                    "%*s %*s %lf %*s %lf %*s %lf %*s %lf %*s %d %*s %d %*s %d",
+                    "%*s %*s %lf %*s %lf %*s %lf %*s %lf %*s %d %*s %d %*s %d %s",
                     &(phypo->x), &(phypo->y), &(phypo->z),
                     &hypo_sec,
-                    &(phypo->ix), &(phypo->iy), &(phypo->iz))
+                    &(phypo->ix), &(phypo->iy), &(phypo->iz),
+                    phypo->type // 20170811 AJL - added to allow saving of expectation hypocenter results instead of maximum likelihood
+                    )
                     == EOF)
                 goto eof_exit;
             phypo->sec = (long double) hypo_sec;
@@ -2556,7 +3409,7 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
         } else if (strncmp(line, "QUALITY", 7) == 0) {
             /* QUALITY */
             if (sscanf(line,
-                    "%*s %*s %lf %*s %lf %*s %lf %*s %lf %*s %d %*s %lf %*s %lf %*s %lf %d %*s %lf %d",
+                    "%*s %*s %Lf %*s %lf %*s %lf %*s %lf %*s %d %*s %lf %*s %lf %*s %lf %d %*s %lf %d",
                     &phypo->probmax, &phypo->misfit,
                     &phypo->grid_misfit_max,
                     &phypo->rms, &phypo->nreadings, &phypo->gap,
@@ -2567,7 +3420,7 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
                 goto eof_exit;
             if (GeometryMode == MODE_GLOBAL)
                 phypo->dist /= KM2DEG; // always store in memory in km
-        } else if (strncmp(line, "QUALITY2", 8) == 0) {    // 20100519 AJL Added new hypo line
+        } else if (strncmp(line, "QUALITY2", 8) == 0) { // 20100519 AJL Added new hypo line
             /* QUALITY2 */
             if (sscanf(line,
                     "%*s %*s %lf",
@@ -2603,6 +3456,13 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
             if (sscanf(line,
                     "%*s %*s %lf %*s %lf %*s %lf",
                     &phypo->expect_dlat, &phypo->expect_dlong, &phypo->expect.z) == EOF)
+                goto eof_exit;
+        } else if (strncmp(line, "MAXIMUM_LIKELIHOOD", 18) == 0) {
+            /* MAXIMUM_LIKELIHOOD */
+            // 20170811 AJL - added to allow saving of expectation hypocenter results instead of maximum likelihood
+            if (sscanf(line,
+                    "%*s %*s %lf %*s %lf %*s %lf %*s %lf",
+                    &phypo->max_like_dlat, &phypo->max_like_dlong, &phypo->max_like.z, &phypo->max_like_sec) == EOF)
                 goto eof_exit;
         } else if (strncmp(line, "ELLIPSOID", 9) == 0) {
             /* ELLIPSOID */
@@ -2640,8 +3500,7 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
 
             /* DIFFERENTIAL */
             /* Nhyp n */
-            if (sscanf(line, "%*s %*s %ld", &phypo->event_id
-                    ) == EOF)
+            if (sscanf(line, "%*s %*s %ld", &phypo->event_id) == EOF)
                 goto eof_exit;
         } else if (strncmp(line, "PHASE", 5) == 0) {
 
@@ -2714,6 +3573,7 @@ int GetHypLoc(FILE *fpio, const char* filein, HypoDesc* phypo,
     /* return at end of file */
 eof_exit:
     if (ifile) {
+
         fclose(fpio);
         NumFilesOpen--;
     }
@@ -2729,6 +3589,8 @@ eof_exit:
                 2    if observation and calculated parts of phase read
                 EOF  if EOF or error occurs before any values read
                 -1   otherwise
+ *
+ * NOTE: if this function is changed, then Early-est->trace_processing/timedomain_processing/timedomain_processing_data.c->get_next_pick_nll() should be modified.
  */
 
 int ReadArrival(char* line, ArrivalDesc* parr, int iReadType) {
@@ -2768,6 +3630,13 @@ int ReadArrival(char* line, ArrivalDesc* parr, int iReadType) {
             &(parr->amplitude),
             &(parr->period)
             );
+
+    // check for QUAL error type and convert to GAU error using LOCQUAL2ERR
+    // 20160727 AJL - added
+    if (strcmp(parr->error_type, "QUAL") == 0) {
+        parr->quality = (int) lround(parr->error);
+        Qual2Err(parr);
+    }
 
     // DEBUG
     /*printf("%s %s %s %s %s %s %ld %ld %lf %s %lf %lf %lf %lf %lf\n",
@@ -2902,7 +3771,7 @@ int WriteArrival(FILE* fpio, ArrivalDesc* parr, int iWriteType) {
         // write observation part of phase line
 
         istat = fprintf(fpio,
-                "%-6.6s %-4.4s %-4.4s %-1.1s %-6.6s %-1.1s %8.8ld %4.4ld %9.4lg %-3.3s %9.2lg %9.2lg %9.2lg %9.2lg",
+                "%-6.6s %-4.4s %-4.4s %-1.1s %-6.6s %-1.1s %8.8ld %4.4ld %9.4lf %-3.3s %9.2le %9.2le %9.2le %9.2le",
                 parr->label,
                 parr->inst,
                 parr->comp,
@@ -2996,6 +3865,7 @@ int WriteArrival(FILE* fpio, ArrivalDesc* parr, int iWriteType) {
 
     istat = fprintf(fpio, "\n");
     if (istat < 0)
+
         return (-1);
 
     return (0);
@@ -3004,7 +3874,7 @@ int WriteArrival(FILE* fpio, ArrivalDesc* parr, int iWriteType) {
 
 /** function to clone (deep copy) a HypoDesc */
 
-HypoDesc* cloneHypoDesc(HypoDesc *phypo_orig) {
+HypoDesc * cloneHypoDesc(HypoDesc * phypo_orig) {
 
     HypoDesc *phypo = NULL;
 
@@ -3014,6 +3884,7 @@ HypoDesc* cloneHypoDesc(HypoDesc *phypo_orig) {
     if (phypo == NULL) { // memory allocation problem
         nll_puterr("ERROR: cloneHypoDesc(): allocating memory for hypocenter.\n");
     } else {
+
         *phypo = *phypo_orig;
     }
 
@@ -3039,7 +3910,7 @@ HypoDesc* cloneHypoDesc(HypoDesc *phypo_orig) {
 
 /** function to clone (deep copy) an array of ArrivalDesc's */
 
-ArrivalDesc* cloneArrivalDescArray(ArrivalDesc* parrivals_orig, int narrivals) {
+ArrivalDesc * cloneArrivalDescArray(ArrivalDesc* parrivals_orig, int narrivals) {
 
     int i;
     ArrivalDesc* parrivals;
@@ -3048,6 +3919,7 @@ ArrivalDesc* cloneArrivalDescArray(ArrivalDesc* parrivals_orig, int narrivals) {
     if (parrivals == NULL) { // memory allocation problem
         nll_puterr("ERROR: cloneArrivalDescArray(): allocating memory for arrivals.\n");
     } else {
+
         for (i = 0; i < narrivals; i++)
             parrivals[i] = parrivals_orig[i];
     }
@@ -3058,7 +3930,7 @@ ArrivalDesc* cloneArrivalDescArray(ArrivalDesc* parrivals_orig, int narrivals) {
 
 /** function to clone (deep copy) a GridDesc */
 
-GridDesc* cloneGridDesc(GridDesc* pgrid_orig) {
+GridDesc * cloneGridDesc(GridDesc * pgrid_orig) {
 
     GridDesc* pgrid;
 
@@ -3066,6 +3938,7 @@ GridDesc* cloneGridDesc(GridDesc* pgrid_orig) {
     if (pgrid == NULL) { // memory allocation problem
         nll_puterr("ERROR: cloneGridDesc(): allocating memory for grid.\n");
     } else {
+
         *pgrid = *pgrid_orig;
     }
 
@@ -3119,6 +3992,7 @@ int WriteArrivalHypo(FILE* fpio, ArrivalDesc* arrival, int iwriteEOL) {
     }
 
     if (istat < 0)
+
         return (-1);
 
     return (0);
@@ -3173,6 +4047,18 @@ double getGMTJVAL(int n_proj, char* jval_string, double xlen, double vxmax, doub
 
         return (gmt_scale);
 
+    } else if (map_itype[n_proj] == MAP_TRANS_TM) {
+
+        /* -Jtlon0/[lat0/]scale or -JTlon0/[lat0/]width (Transverse Mercator [C])
+           Give the central meridian lon0, central parallel lat0 (optional), and scale (1:xxxx or UNIT/degree).
+         */
+
+        gmt_scale = (ylen / (vymax - vymin)); // * (xmaxrect0 - xminrect0) / (xmaxrect - xminrect);
+        sprintf(jval_string, "-JT%lf/%lf/%lf",
+                map_orig_long[n_proj], map_orig_lat[n_proj], xlen);
+
+        return (gmt_scale);
+
     }
 
     return (-1.0);
@@ -3207,7 +4093,7 @@ int convertCoordsRect(int proj_index_from, int proj_index_to, double x, double y
 
 /* rotation about rect coord origin */
 
-INLINE int latlon2rect(int n_proj, double dlat, double dlong, double* pxrect, double* pyrect) {
+int latlon2rect(int n_proj, double dlat, double dlong, double* pxrect, double* pyrect) {
 
     double xtemp, ytemp;
 
@@ -3272,6 +4158,17 @@ INLINE int latlon2rect(int n_proj, double dlat, double dlong, double* pxrect, do
         *pyrect = ytemp * map_cosang[n_proj] + xtemp * map_sinang[n_proj];
 
         return (0);
+
+    } else if (map_itype[n_proj] == MAP_TRANS_TM) {
+
+        tm(n_proj, dlong, dlat, &xtemp, &ytemp);
+        xtemp /= 1000.0; /* m -> km */
+        ytemp /= 1000.0; /* m -> km */
+        *pxrect = xtemp * map_cosang[n_proj] - ytemp * map_sinang[n_proj];
+        *pyrect = ytemp * map_cosang[n_proj] + xtemp * map_sinang[n_proj];
+
+        return (0);
+
     }
 
     return (-1);
@@ -3280,7 +4177,7 @@ INLINE int latlon2rect(int n_proj, double dlat, double dlong, double* pxrect, do
 
 /** function to convert rectangular km coord to lat/long */
 
-INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, double* pdlong) {
+int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, double* pdlong) {
 
     double xtemp, ytemp;
 
@@ -3289,12 +4186,21 @@ INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, do
     if (map_itype[n_proj] == MAP_TRANS_GLOBAL) {
         *pdlat = yrect;
         *pdlong = xrect;
+        if (*pdlong < -180.0)
+            *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+            *pdlong -= 360.0;
 
         return (0);
 
     } else if (map_itype[n_proj] == MAP_TRANS_NONE) {
         *pdlat = yrect;
         *pdlong = xrect;
+        /* 20170321 AJL - bug fix
+        if (*pdlong < -180.0)
+         *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+         *pdlong -= 360.0;*/
 
         return (0);
 
@@ -3303,6 +4209,11 @@ INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, do
         ytemp = yrect * map_cosang[n_proj] - xrect * map_sinang[n_proj];
         *pdlat = map_orig_lat[n_proj] + ytemp / c111;
         *pdlong = map_orig_long[n_proj] + xtemp / (c111 * cos(cRPD * *pdlat));
+        // 20121005 AJL - prevent longitude outside of -180 -> 180 deg range
+        if (*pdlong < -180.0)
+            *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+            *pdlong -= 360.0;
 
         return (0);
 
@@ -3325,6 +4236,11 @@ INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, do
         xlt1 = atan(MAP_TRANS_SDC_DRLT * tan(DE2RA * (*pdlat + map_orig_lat[n_proj]) / 2.0));
         xtemp = xtemp / (map_sdc_xlnkm[n_proj] * cos(xlt1));
         *pdlong = map_orig_long[n_proj] + xtemp;
+        // 20121005 AJL - prevent longitude outside of -180 -> 180 deg range
+        if (*pdlong < -180.0)
+            *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+            *pdlong -= 360.0;
 
         return (0);
 
@@ -3333,8 +4249,27 @@ INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, do
         xtemp = xrect * map_cosang[n_proj] + yrect * map_sinang[n_proj];
         ytemp = yrect * map_cosang[n_proj] - xrect * map_sinang[n_proj];
         ilamb(n_proj, pdlong, pdlat, xtemp * 1000.0, ytemp * 1000.0);
+        // 20121005 AJL - prevent longitude outside of -180 -> 180 deg range
+        if (*pdlong < -180.0)
+            *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+            *pdlong -= 360.0;
 
         return (0);
+
+    } else if (map_itype[n_proj] == MAP_TRANS_TM) {
+
+        xtemp = xrect * map_cosang[n_proj] + yrect * map_sinang[n_proj];
+        ytemp = yrect * map_cosang[n_proj] - xrect * map_sinang[n_proj];
+        itm(n_proj, pdlong, pdlat, xtemp * 1000.0, ytemp * 1000.0);
+        // 20121005 AJL - prevent longitude outside of -180 -> 180 deg range
+        if (*pdlong < -180.0)
+            *pdlong += 360.0;
+        else if (*pdlong > 180.0)
+            *pdlong -= 360.0;
+
+        return (0);
+
     }
 
     return (-1);
@@ -3342,12 +4277,13 @@ INLINE int rect2latlon(int n_proj, double xrect, double yrect, double* pdlat, do
 
 /** function to convert rectangular km angle to lat/long angle */
 
-INLINE double rect2latlonAngle(int n_proj, double rectAngle) {
+double rect2latlonAngle(int n_proj, double rectAngle) {
     double angle;
 
     if (map_itype[n_proj] == MAP_TRANS_SIMPLE ||
             map_itype[n_proj] == MAP_TRANS_SDC ||
-            map_itype[n_proj] == MAP_TRANS_LAMBERT) {
+            map_itype[n_proj] == MAP_TRANS_LAMBERT ||
+            map_itype[n_proj] == MAP_TRANS_TM) {
         angle = rectAngle - map_rot[n_proj];
         if (angle < 0.0)
             angle += 360.0;
@@ -3360,12 +4296,13 @@ INLINE double rect2latlonAngle(int n_proj, double rectAngle) {
 
 /** function to convert lat/long km angle to rectangular angle */
 
-INLINE double latlon2rectAngle(int n_proj, double latlonAngle) {
+double latlon2rectAngle(int n_proj, double latlonAngle) {
     double angle;
 
     if (map_itype[n_proj] == MAP_TRANS_SIMPLE ||
             map_itype[n_proj] == MAP_TRANS_SDC ||
-            map_itype[n_proj] == MAP_TRANS_LAMBERT) {
+            map_itype[n_proj] == MAP_TRANS_LAMBERT ||
+            map_itype[n_proj] == MAP_TRANS_TM) {
         angle = latlonAngle + map_rot[n_proj];
         if (angle < 0.0)
             angle += 360.0;
@@ -3408,6 +4345,7 @@ int ConvertASourceLocation(int n_proj, SourceDesc *srce_in, int toXY, int toLatL
         srce_in->z = srce_in->depth;
     }
     if (toLatLon && srce_in->is_coord_xyz && !srce_in->is_coord_latlon) {
+
         istat = rect2latlon(n_proj, srce_in->x, srce_in->y,
                 &(srce_in->dlat), &(srce_in->dlong));
         srce_in->depth = srce_in->z;
@@ -3509,6 +4447,7 @@ void MonthDay(int year, int yearday, int* pmonth, int* pday) {
     int i, leap;
 
     leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+
     for (i = 1; yearday > daytab[leap][i]; i++)
         yearday -= daytab[leap][i];
     *pmonth = i;
@@ -3519,13 +4458,14 @@ void MonthDay(int year, int yearday, int* pmonth, int* pday) {
 /** function to construct current date/time string */
 
 char* CurrTimeStr(void) {
+
     static char timestr[MAXLINE];
     time_t curr_time;
 
     curr_time = time(NULL);
 
-    strftime(timestr, (size_t) MAXLINE,
-            "%d%b%Y %Hh%Mm%S", localtime(&curr_time));
+    strftime(timestr, (size_t) MAXLINE, "%d%b%Y %Hh%Mm%S", localtime(&curr_time));
+
     return (timestr);
 
 }
@@ -3575,14 +4515,23 @@ int ExpandWildCards(char* fileFilter, char fileList[][FILENAME_MAX], int maxNumF
     } else if (n == 0) {
         nll_puterr2("ERROR: empty directory: expanding wildcard filenames in: ", fileFilter);
         return (-1);
+    } else if (n > maxNumFiles) { // 20111011 AJL - added this block to catch excess number of wildcard files
+        sprintf(MsgStr,
+                "ERROR: too many files: expanding wildcard filenames in: %s, max number of files = %d",
+                fileFilter, maxNumFiles);
+        nll_puterr(MsgStr);
+        return (-1);
     } else {
         while (--n >= 0) {
+
             sprintf(fileList[n], "%s/%s", directory, namelist[n]->d_name);
             /*DEBUG*///printf("%s -> %s\n", namelist[n]->d_name,fileList[n]);
             nfiles++;
             free(namelist[n]);
+            namelist[n] = NULL;
         }
         free(namelist);
+        namelist = NULL;
     }
 
     return (nfiles);
@@ -3592,7 +4541,7 @@ int ExpandWildCards(char* fileFilter, char fileList[][FILENAME_MAX], int maxNumF
 
 /** function to wrap fnmatch */
 
-int fnmatch_wrapper(struct dirent* entry) {
+int fnmatch_wrapper(const struct dirent * entry) {
     int match = 0;
     int flags = 0;
     match = fnmatch(ExpandWildCards_pattern, entry->d_name, flags);
@@ -3659,17 +4608,17 @@ int SortArrivalsTime(ArrivalDesc* arrival, int num_arrivals) {
     qsort((void *) arrival, (size_t) num_arrivals, sizeof (ArrivalDesc),
             (int (*)(const void *, const void *)) CmpArrivalsTime);
 
-
     return (0);
 
 }
 
 /** function to compare arrivals by obs_time field */
 
-int CmpArrivalsTime(const ArrivalDesc *keyval, const ArrivalDesc *datum) {
+int CmpArrivalsTime(const ArrivalDesc *keyval, const ArrivalDesc * datum) {
     if (keyval->obs_time < datum->obs_time)
         return (-1);
     if (keyval->obs_time > datum->obs_time)
+
         return (1);
 
     return (0);
@@ -3682,17 +4631,17 @@ int SortArrivalsIgnore(ArrivalDesc* arrival, int num_arrivals) {
     qsort((void *) arrival, (size_t) num_arrivals, sizeof (ArrivalDesc),
             (int (*)(const void *, const void *)) CmpArrivalsIgnore);
 
-
     return (0);
 
 }
 
 /** function to compare arrivals by flag_ignore field */
 
-int CmpArrivalsIgnore(const ArrivalDesc *keyval, const ArrivalDesc *datum) {
+int CmpArrivalsIgnore(const ArrivalDesc *keyval, const ArrivalDesc * datum) {
     if (keyval->flag_ignore < datum->flag_ignore)
         return (-1);
     if (keyval->flag_ignore > datum->flag_ignore)
+
         return (1);
 
     return (0);
@@ -3705,17 +4654,23 @@ int SortArrivalsDist(ArrivalDesc* arrival, int num_arrivals) {
     qsort((void *) arrival, (size_t) num_arrivals, sizeof (ArrivalDesc),
             (int (*)(const void *, const void *)) CmpArrivalsDist);
 
-
     return (0);
 
 }
 
 /** function to compare arrivals by dist field */
 
-int CmpArrivalsDist(const ArrivalDesc *keyval, const ArrivalDesc *datum) {
+int CmpArrivalsDist(const ArrivalDesc *keyval, const ArrivalDesc * datum) {
     if (keyval->dist < datum->dist)
         return (-1);
     if (keyval->dist > datum->dist)
+        return (1);
+
+    // if same distance, assume same sta sort by time   // 20161004 AJL - added
+    if (keyval->obs_time < datum->obs_time)
+        return (-1);
+    if (keyval->obs_time > datum->obs_time)
+
         return (1);
 
     return (0);
@@ -3728,7 +4683,6 @@ int SortDoubles(double* array, int num_elements) {
     qsort((void *) array, (size_t) num_elements, sizeof (double),
             (int (*)(const void *, const void *)) CmpDoubles);
 
-
     return (0);
 
 }
@@ -3739,6 +4693,7 @@ int CmpDoubles(const double *keyval, const double *datum) {
     if (*keyval < *datum)
         return (-1);
     if (*keyval > *datum)
+
         return (1);
 
     return (0);
@@ -3760,6 +4715,7 @@ TakeOffAngles SetTakeOffAngles(double azim, double dip, int iqual) {
 /** function to set float values in take-off angles union */
 
 void SetAnglesFloat(TakeOffAngles* pangles, float fvalue) {
+
     pangles->fval = fvalue;
 }
 
@@ -3797,7 +4753,7 @@ int ReadTakeOffAnglesFile(char *fname, double xloc, double yloc, double zloc,
     }
 
     /* get angles float value on grid */
-    fvalue = ReadAbsInterpGrid3d(fp_grid, &gdesc, xloc, yloc, zloc);
+    fvalue = ReadAbsInterpGrid3d(fp_grid, &gdesc, xloc, yloc, zloc, 0);
 
     /* get angles */
     SetAnglesFloat(&angles, fvalue);
@@ -3816,7 +4772,7 @@ int ReadTakeOffAnglesFile(char *fname, double xloc, double yloc, double zloc,
     }
 
     /* close angle grid file */
-    CloseGrid3dFile(&fp_grid, &fp_hdr);
+    CloseGrid3dFile(&gdesc, &fp_grid, &fp_hdr);
 
     return (0);
 
@@ -3841,11 +4797,12 @@ double GaussDev() {
             r = v1 * v1 + v2*v2;
         } while (r >= 1.0);
         fac = sqrt(-2.0 * log(r) / r);
-        gset = v1*fac;
+        gset = v1 * fac;
         iset = 1;
-        return v2*fac;
+        return v2 * fac;
     } else {
         iset = 0;
+
         return gset;
     }
 }
@@ -3886,6 +4843,7 @@ void TestGaussDev() {
     for (n = 1; n < NUM_BIN - 1; n++) {
         fprintf(stdout,
                 "  Bin %lf,%lf  N=%ld\n", binmax[n - 1], binmax[n], ibin[n]);
+
         if (binmax[n - 1] >= -1.0 && binmax[n] <= 1.0)
             sum_one_std += ibin[n];
     }
@@ -3900,7 +4858,7 @@ void TestGaussDev() {
 /** function to generate and display "traditional" statistics from grid file */
 
 int GenTraditionStats(GridDesc *pgrid, Vect3D *pexpect, Mtrx3D *pcov,
-        FILE* fpgrid) {
+        FILE * fpgrid) {
     int istat;
 
 
@@ -3970,7 +4928,7 @@ int GenTraditionStats(GridDesc *pgrid, Vect3D *pexpect, Mtrx3D *pcov,
 
 /** function to calculate the expectation (mean) of a PDF grid */
 
-Vect3D CalcExpectation(GridDesc* pgrid, FILE* fpgrid) {
+Vect3D CalcExpectation(GridDesc* pgrid, FILE * fpgrid) {
 
     int ix, iy, iz;
 
@@ -3992,7 +4950,7 @@ Vect3D CalcExpectation(GridDesc* pgrid, FILE* fpgrid) {
 
                 if (fpgrid != NULL)
                     val = ReadGrid3dValue(fpgrid,
-                        ix, iy, iz, pgrid);
+                        ix, iy, iz, pgrid, 0);
                 else
                     val = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix][iy][iz];
 
@@ -4009,13 +4967,12 @@ Vect3D CalcExpectation(GridDesc* pgrid, FILE* fpgrid) {
     expect.y = pgrid->origy + expect.y * pgrid->dy * volume;
     expect.z = pgrid->origz + expect.z * pgrid->dz * volume;
 
-
     return (expect);
 }
 
 /** function to calculate the covariance a PDF grid */
 
-Mtrx3D CalcCovariance_OLD(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
+Mtrx3D CalcCovariance_OLD(GridDesc* pgrid, Vect3D* pexpect, FILE * fpgrid) {
 
     int ix, iy, iz;
 
@@ -4057,7 +5014,7 @@ Mtrx3D CalcCovariance_OLD(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
                 zz = z * z;
 
                 if (fpgrid != NULL)
-                    val = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid);
+                    val = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid, 0);
                 else
                     val = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix][iy][iz];
 
@@ -4081,7 +5038,7 @@ Mtrx3D CalcCovariance_OLD(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
 
     volume = pgrid->dx * pgrid->dy * pgrid->dz;
 
-                    printf("DEBUG: cov.yy = cov.yy(%g) * volume(%g) (= %g) - pexpect->y(%g) * pexpect->y (= %g)\n", cov.yy, volume, cov.yy * volume, pexpect->y, pexpect->y * pexpect->y);
+    printf("DEBUG: cov.yy = cov.yy(%g) * volume(%g) (= %g) - pexpect->y(%g) * pexpect->y (= %g)\n", cov.yy, volume, cov.yy * volume, pexpect->y, pexpect->y * pexpect->y);
     cov.xx = cov.xx * volume - pexpect->x * pexpect->x;
     cov.xy = cov.xy * volume - pexpect->x * pexpect->y;
     cov.xz = cov.xz * volume - pexpect->x * pexpect->z;
@@ -4094,14 +5051,14 @@ Mtrx3D CalcCovariance_OLD(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
     cov.zy = cov.yz;
     cov.zz = cov.zz * volume - pexpect->z * pexpect->z;
 
-                    printf("DEBUG: CalcCovariance: volume= %g  cov.yy= %g\n", volume, cov.yy);
+    printf("DEBUG: CalcCovariance: volume= %g  cov.yy= %g\n", volume, cov.yy);
 
     return (cov);
 }
 
 /** function to calculate the covariance a PDF grid */
 
-Mtrx3D CalcCovariance(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
+Mtrx3D CalcCovariance(GridDesc* pgrid, Vect3D* pexpect, FILE * fpgrid) {
 
     int ix, iy, iz;
 
@@ -4143,7 +5100,7 @@ Mtrx3D CalcCovariance(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
                 zz = z * z;
 
                 if (fpgrid != NULL)
-                    val = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid);
+                    val = ReadGrid3dValue(fpgrid, ix, iy, iz, pgrid, 0);
                 else
                     val = ((GRID_FLOAT_TYPE ***) pgrid->array)[ix][iy][iz];
 
@@ -4167,7 +5124,7 @@ Mtrx3D CalcCovariance(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
 
     volume = pgrid->dx * pgrid->dy * pgrid->dz;
 
-                    printf("DEBUG: cov.yy = cov.yy(%g) * volume(%g) (= %g) - pexpect->y(%g) * pexpect->y (= %g)\n", cov.yy, volume, cov.yy * volume, pexpect->y, pexpect->y * pexpect->y);
+    printf("DEBUG: cov.yy = cov.yy(%g) * volume(%g) (= %g) - pexpect->y(%g) * pexpect->y (= %g)\n", cov.yy, volume, cov.yy * volume, pexpect->y, pexpect->y * pexpect->y);
     cov.xx = cov.xx * volume;
     cov.xy = cov.xy * volume;
     cov.xz = cov.xz * volume;
@@ -4180,18 +5137,19 @@ Mtrx3D CalcCovariance(GridDesc* pgrid, Vect3D* pexpect, FILE* fpgrid) {
     cov.zy = cov.yz;
     cov.zz = cov.zz * volume;
 
-                    printf("DEBUG: CalcCovariance: volume= %g  cov.yy= %g\n", volume, cov.yy);
+    printf("DEBUG: CalcCovariance: volume= %g  cov.yy= %g\n", volume, cov.yy);
 
     return (cov);
 }
 
 /** function to calculate the covariance of a set of samples */
 
-Mtrx3D CalcCovarianceSamples(float* fdata, int nSamples, Vect3D* pexpect) {
+Mtrx3D CalcCovarianceSamples(float* fdata, int nSamples, Vect3D * pexpect) {
 
-    printf("GeometryMode %s\n", GeometryMode == MODE_GLOBAL ? "MODE_GLOBAL": "MODE_RECT");
+    //printf("GeometryMode %s\n", GeometryMode == MODE_GLOBAL ? "MODE_GLOBAL" : "MODE_RECT");
     if (GeometryMode == MODE_GLOBAL)
         return (CalcCovarianceSamplesGlobal(fdata, nSamples, pexpect));
+
     else
         return (CalcCovarianceSamplesRect(fdata, nSamples, pexpect));
 
@@ -4321,6 +5279,7 @@ int LineIsBlank(char *line) {
     pstr = line;
     while (*pstr) {
         if (!isspace(*pstr++))
+
             return (0);
     }
 
@@ -4429,13 +5388,14 @@ int ReadFortranReal(char* line, int istart, int ilen, double* pdblval) {
 
 /** function to convert phase error to hypo71 style quality */
 
-int Err2Qual(ArrivalDesc *arrival) {
+int Err2Qual(ArrivalDesc * arrival) {
     int errLevel;
 
     /* find error level with error >= arrival error */
     for (errLevel = 0; errLevel < NumQuality2ErrorLevels; errLevel++) {
         if (arrival->error <= Quality2Error[errLevel]) {
             arrival->quality = errLevel;
+
             return (errLevel);
         }
     }
@@ -4446,7 +5406,7 @@ int Err2Qual(ArrivalDesc *arrival) {
 
 /** function to convert quality to error */
 
-void Qual2Err(ArrivalDesc *arrival) {
+void Qual2Err(ArrivalDesc * arrival) {
 
     /* set error fields */
     strcpy(arrival->error_type, "GAU");
@@ -4454,6 +5414,7 @@ void Qual2Err(ArrivalDesc *arrival) {
             arrival->quality < NumQuality2ErrorLevels) {
         arrival->error = Quality2Error[arrival->quality];
     } else {
+
         arrival->error = Quality2Error[NumQuality2ErrorLevels - 1];
         nll_puterr("WARNING: invalid arrival quality.");
     }
@@ -4494,14 +5455,95 @@ int GetQuality2Err(char* line1) {
     }
 
     if (ierr < 0)
+
         return (-1);
 
     return (0);
 }
 
+/** function to check if phase_in matches phase_check
+true if phase_in == phase_check
+true if phase_in is in phase ID list for phase_check */
+
+int IsPhaseID(char *phase_in, char *phase_check) {
+    int npha_id;
+    char test_str[PHASE_LABEL_LEN + 4];
+
+    //printf("phase_in %s, phase_check %s, ", phase_in, phase_check);
+    /* check for blank phase_in */
+    if (strstr("              ", phase_in) != NULL) {
+        //printf(" NO - BLANK\n");
+        return (0);
+    }
+
+    // check if phase_in == phase_check (AJL 20041201 added)
+    if (strcmp(phase_in, phase_check) == 0) {
+        //printf(" YES (%s %s)\n", phase_in, phase_check);
+        return (1);
+    }
+
+    // check if phase_in is in phase ID list for phase_check
+    removeSpace(phase_in);
+    sprintf(test_str, " %s ", phase_in);
+    for (npha_id = 0; npha_id < NumPhaseID; npha_id++) {
+        //printf(" compare (<%s> <%s>)\n", PhaseID[npha_id].id_string, test_str);
+        if (strcmp(PhaseID[npha_id].phase, phase_check) == 0) {
+            if (strstr(PhaseID[npha_id].id_string, test_str) != NULL) {
+                //printf(" YES (%s %s)\n", PhaseID[npha_id].id_string,  phase_in);
+
+                return (1);
+            }
+        }
+    }
+
+    //printf(" NO\n");
+    return (0);
+}
+
+/** function to evaluate phase ID from phase ID lists */
+// 20161004 AJL - moved here from NLLocLib.c
+
+int EvalPhaseID(char *phase_out, char *phase_in) {
+    int npha_id;
+
+    for (npha_id = 0; npha_id < NumPhaseID; npha_id++) {
+        if (IsPhaseID(phase_in, PhaseID[npha_id].phase)) {
+            if (phase_out != NULL)
+                strcpy(phase_out, PhaseID[npha_id].phase);
+            return (1);
+        }
+    }
+
+    if (phase_out != NULL)
+        strcpy(phase_out, phase_in);
+
+    return (0); // returned unchanged
+}
+
+/** function remove whitespace from string */
+
+void removeSpace(char *str) {
+
+    int n, m;
+
+    n = 0;
+    while (str[n] != '\0' && n < 1000000)
+        if (isspace(str[n])) {
+            m = n;
+            while (str[m] != '\0' && m < 1000000) {
+                str[m] = str[m + 1];
+                m++;
+            }
+        } else {
+
+            n++;
+        }
+
+}
+
 /** function to read fpfit summary record to HypoDesc structure */
 
-int ReadFpfitSum(FILE *fp_in, HypoDesc *phypo) {
+int ReadFpfitSum(FILE *fp_in, HypoDesc * phypo) {
 
     int istat;
     char *cstat;
@@ -4671,7 +5713,6 @@ int ReadHypoDDInitHypo(FILE *fp_in, HypoDesc *phypo, int n_proj) {
     phypo->z = phypo->depth;
     phypo->dotime = 0.0;
 
-
     return (istat == 14 ? 1 : -1);
 
 
@@ -4686,7 +5727,7 @@ int ReadHypoDDInitHypo(FILE *fp_in, HypoDesc *phypo, int n_proj) {
  */
 
 
-int WriteHypoDDInitHypo(FILE *fp_out, HypoDesc *phypo) {
+int WriteHypoDDInitHypo(FILE *fp_out, HypoDesc * phypo) {
 
     fprintf(fp_out,
             "%4.4d%2.2d%2.2d  %2.2d%2.2d%4.4d %9.4f %10.4f %10.3f %4.1f %7.2f %7.2f %6.2f %10ld  %10.4f %10.4f %10.4f\n",
@@ -4715,7 +5756,7 @@ NCJBG    -0.020649910    0.60    P
 NCJPS    -0.011000156    0.50    P
  */
 
-int WriteHypoDDXCorrDiff(FILE *fp_out, int num_arrivals, ArrivalDesc *arrival, HypoDesc* hypos) {
+int WriteHypoDDXCorrDiff(FILE *fp_out, int num_arrivals, ArrivalDesc *arrival, HypoDesc * hypos) {
 
     int narr;
     long dd_event_id_1, dd_event_id_2;
@@ -4733,6 +5774,7 @@ int WriteHypoDDXCorrDiff(FILE *fp_out, int num_arrivals, ArrivalDesc *arrival, H
             continue;
 
         if (parr->dd_event_id_1 != dd_event_id_1 || parr->dd_event_id_2 != dd_event_id_2) {
+
             dd_event_id_1 = parr->dd_event_id_1;
             dd_event_id_2 = parr->dd_event_id_2;
             // set new otime corr OTC based on current perturbatios to otimes
@@ -4808,11 +5850,209 @@ int WriteDiffArrival(FILE* fpio, HypoDesc* hypos, ArrivalDesc* parr, int iWriteT
 
     istat = fprintf(fpio, "\n");
     if (istat < 0)
+
         return (-1);
 
     return (0);
 
 }
+
+/** function to generate take-off angles from travel time grid
+                                using a numerical gradient aglorithm */
+
+int CalcAnglesGradient(GridDesc* ptgrid, GridDesc* pagrid, int angle_mode, int grid_mode) {
+
+    int ix, iy, iz, edge_flagx = 0, edge_flagy = 0, iflag2D = 0;
+    double origx, origy, origz;
+    double dx, dy, dz, dvol;
+    double xlow = 0.0, xhigh = 0.0;
+    double azim, dip;
+    int iqual;
+
+    TakeOffAngles angles = AnglesNULL;
+
+
+    /* write message */
+    sprintf(MsgStr, "Generating take-off angle grid...");
+    nll_putmsg(1, MsgStr);
+
+
+    if (grid_mode == GRID_TIME_2D) {
+        iflag2D = 1;
+        xlow = xhigh = 0.0;
+    }
+
+    /* estimate take-off angles from numerical gradients */
+
+    origx = pagrid->origx;
+    origy = pagrid->origy;
+    origz = pagrid->origz;
+    dx = pagrid->dx;
+    dy = pagrid->dy;
+    dz = pagrid->dz;
+    dvol = dx * dy * dz;
+
+    for (ix = 0; ix < pagrid->numx; ix++) {
+        /* 2D grids, store angles in ix = 0 sheet */
+        if (ix == 1 && iflag2D)
+            edge_flagx = 1;
+        if ((ix == 0 || ix == pagrid->numx - 1)
+                && grid_mode == GRID_TIME)
+            edge_flagx = 1;
+        for (iy = 0; iy < pagrid->numy; iy++) {
+            if (iy == 0 || iy == pagrid->numy - 1)
+                edge_flagy = 1;
+            for (iz = 0; iz < pagrid->numz; iz++) {
+
+                /* no calculation for edges of grid */
+                if (edge_flagx || edge_flagy
+                        || iz == 0 || iz == pagrid->numz - 1) {
+                    ((GRID_FLOAT_TYPE ***) pagrid->array)[ix][iy][iz] = AnglesNULL.fval;
+                    continue;
+                }
+
+                if (!iflag2D) {
+                    xlow = ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix - 1][iy][iz];
+                    xhigh = ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix + 1][iy][iz];
+                }
+                angles = GetGradientAngles(
+                        ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix][iy][iz],
+                        xlow,
+                        xhigh,
+                        ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix][iy - 1][iz],
+                        ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix][iy + 1][iz],
+                        /* intentional reversal of z
+                                signs to get pos = up */
+                        ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix][iy][iz + 1],
+                        ((GRID_FLOAT_TYPE ***) ptgrid->array)[ix][iy][iz - 1],
+                        dx, dy, dz, iflag2D,
+                        &azim, &dip, &iqual);
+                if (angle_mode == ANGLE_MODE_YES) {
+                    ((GRID_FLOAT_TYPE ***) pagrid->array)[ix][iy][iz] = angles.fval;
+                } else if (angle_mode == ANGLE_MODE_INCLINATION) {
+                    ((
+
+                            GRID_FLOAT_TYPE ***) pagrid->array)[ix][iy][iz] = dip;
+                }
+
+            }
+            edge_flagy = 0;
+        }
+        edge_flagx = 0;
+    }
+
+
+    return (0);
+
+}
+
+/** function to generate take-off angles from time grid node values */
+
+TakeOffAngles GetGradientAngles(double vcent, double xlow, double xhigh,
+        double ylow, double yhigh, double zlow, double zhigh,
+        double dx, double dy, double dz, int iflag2D,
+        double *pazim, double *pdip, int *piqual) {
+
+    double grad_low, grad_high, gradx, grady, gradz, azim, dip;
+    int iqualx, iqualy, iqualz, iqual, iflip;
+    TakeOffAngles angles = AnglesNULL;
+
+
+
+    /* calculate gradient of travel time and quality in Z direction */
+    grad_low = (vcent - zlow) / dz;
+    grad_high = (zhigh - vcent) / dz;
+    iqualz = CalcAnglesQuality(grad_low, grad_high);
+    gradz = (grad_low + grad_high) / 2.0;
+    gradz = -gradz; /* reverse sign to get take-off angle */
+
+    /* calculate gradient of travel time and quality in Y direction */
+    grad_low = (vcent - ylow) / dy;
+    grad_high = (yhigh - vcent) / dy;
+    iqualy = CalcAnglesQuality(grad_low, grad_high);
+    grady = (grad_low + grad_high) / 2.0;
+    grady = -grady; /* reverse sign to get take-off angle */
+
+    /* thats all for 2D grids */
+    if (iflag2D) {
+        /* calculate dip angle (range of 0 (down) to 180 (up)) */
+        dip = atan2(grady, -gradz) / cRPD;
+        iflip = 0;
+        if (dip > 180.0) {
+            dip = dip - 180.0;
+            iflip = 1;
+        } else if (dip < 0.0) {
+            dip = -dip;
+            iflip = 1;
+        }
+        /* calculate azimuth polarity (1 or -1) relative to pos Y dir */
+        azim = iflip ? -1.0 : 1.0;
+        /* find combined quality - weighted average of component qual */
+        iqual = (fabs(grady) * (double) iqualy
+                + fabs(gradz) * (double) iqualz)
+                / (fabs(grady) + fabs(gradz));
+        /* set angles */
+        angles = SetTakeOffAngles(azim, dip, iqual);
+        *pazim = azim;
+        *pdip = dip;
+        *piqual = iqual;
+        return (angles);
+    }
+
+    /* calculate gradient of travel time and quality in X direction */
+    grad_low = (vcent - xlow) / dx;
+    grad_high = (xhigh - vcent) / dx;
+    iqualx = CalcAnglesQuality(grad_low, grad_high);
+    gradx = (grad_low + grad_high) / 2.0;
+    gradx = -gradx; /* reverse sign to get take-off angle */
+
+    /* find combined quality - weighted average of component qual */
+    iqual = (fabs(gradx) * (double) iqualx
+            + fabs(grady) * (double) iqualy
+            + fabs(gradz) * (double) iqualz)
+            / (fabs(gradx) + fabs(grady) + fabs(gradz));
+
+    /* calculate dip angle (range of 0 (down) to 180 (up)) */
+    dip = atan2(sqrt(gradx * gradx + grady * grady), -gradz) / cRPD;
+    /* calculate azimuth angle (0 to 360) */
+    azim = atan2(gradx, grady) / cRPD;
+    if (azim < 0.0)
+        azim += 360.0;
+    angles = SetTakeOffAngles(azim, dip, iqual);
+
+    // return double angles values
+    *pazim = azim;
+    *pdip = dip;
+    *piqual = iqual;
+
+    return (angles);
+
+}
+
+
+
+/** function to estimate quality of take-off angle determination */
+
+/* quality is:	0 if sign of A = grad_low and B = grad_high differ
+                0->10 as (2AB / (AA + BB)) -> 1;
+ */
+
+int CalcAnglesQuality(double grad_low, double grad_high) {
+
+    double ratio;
+
+    /* if both gradients are zero, return highest quality */
+    if (fabs(grad_low) + fabs(grad_high) < SMALL_DOUBLE)
+        return (10);
+
+    /* calculate quality */
+    ratio = 2.0 * grad_low * grad_high /
+            (grad_low * grad_low + grad_high * grad_high);
+    return (ratio > 0.0 ? (int) (10.01 * ratio) : 0);
+
+}
+
+
 
 
 // END - DD
